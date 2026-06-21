@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const { MongoClient, ServerApiVersion } = require('mongodb');
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 require('dotenv').config();
 const app = express();
 const port = 5000;
@@ -32,6 +32,7 @@ async function run() {
 
     const database = client.db('resell_hub');
     const productsCollection = database.collection('products');
+    const reviewsCollection = database.collection('reviews');
     
     // products related api
     // post a product
@@ -56,6 +57,20 @@ async function run() {
       res.send(result);
     })
 
+    // edit a product
+    app.patch('/api/products/:id', async(req,res)=>{
+      const id = req.params;
+      const updatedProduct = req.body;
+      const result = await productsCollection.updateOne({
+        _id: new ObjectId(id)
+      },
+      {
+        $set: updatedProduct
+      })
+      res.send(result);
+      })
+
+   
     // get featured products
     app.get('/api/featured', async(req,res)=>{
       const result = await productsCollection.find({}).limit(6).toArray();
