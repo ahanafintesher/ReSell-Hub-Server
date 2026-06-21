@@ -84,14 +84,19 @@ async function run() {
     })
 
     // reviews related api
-
+    // post review
     app.post('/api/reviews', async(req, res)=>{
       const review = req.body
       const result = await reviewsCollection.insertOne(review);
       res.send(result)
     })
 
-
+    // get review
+    app.get('/api/reviews', async(req,res)=>{
+      const productId = req.query.productId;
+      const result = await reviewsCollection.find({ productId }).toArray();
+      res.send(result);
+    })
 
     await client.db("admin").command({ ping: 1 });
     console.log("Pinged your deployment. You successfully connected to MongoDB!");
