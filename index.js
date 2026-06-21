@@ -70,7 +70,13 @@ async function run() {
       res.send(result);
       })
 
-   
+     // delete a product
+    app.delete('/api/products/:id', async(req,res)=>{
+      const  id  = req.params;
+
+      const result = await productsCollection.deleteOne({ _id: new ObjectId(id) });
+      res.send(result);
+    })
     // get featured products
     app.get('/api/featured', async(req,res)=>{
       const result = await productsCollection.find({}).limit(6).toArray();
