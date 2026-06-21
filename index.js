@@ -34,7 +34,7 @@ async function run() {
     const productsCollection = database.collection('products');
     
     // products related api
-
+    // post a product
     app.post('/api/products', async (req, res) => {
       const product = req.body;
       console.log(product);
@@ -56,7 +56,11 @@ async function run() {
       res.send(result);
     })
 
-    // 
+    // get featured products
+    app.get('/api/featured', async(req,res)=>{
+      const result = await productsCollection.find({}).limit(6).toArray();
+      res.send(result);
+    })
     await client.db("admin").command({ ping: 1 });
     console.log("Pinged your deployment. You successfully connected to MongoDB!");
   } finally {
