@@ -38,7 +38,7 @@ async function run() {
     // post a product
     app.post('/api/products', async (req, res) => {
       const product = req.body;
-      console.log(product);
+      // console.log(product);
       const result = await productsCollection.insertOne(product);
       
       res.send(result);
@@ -82,6 +82,17 @@ async function run() {
       const result = await productsCollection.find({}).limit(6).toArray();
       res.send(result);
     })
+
+    // reviews related api
+
+    app.post('/api/reviews', async(req, res)=>{
+      const review = req.body
+      const result = await reviewsCollection.insertOne(review);
+      res.send(result)
+    })
+
+
+
     await client.db("admin").command({ ping: 1 });
     console.log("Pinged your deployment. You successfully connected to MongoDB!");
   } finally {
