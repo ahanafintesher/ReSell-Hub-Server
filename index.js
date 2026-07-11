@@ -1,7 +1,7 @@
-const express = require('express');
-const cors = require('cors');
-const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-require('dotenv').config();
+const express = require("express");
+const cors = require("cors");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+require("dotenv").config();
 const app = express();
 const port = 5000;
 const uri = process.env.MONGODB_URI;
@@ -9,12 +9,9 @@ const uri = process.env.MONGODB_URI;
 app.use(cors());
 app.use(express.json());
 
-
-app.get('/', (req, res) => {
-  res.send('Hello World!');
+app.get("/", (req, res) => {
+  res.send("Hello World!");
 });
-
-
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
@@ -22,91 +19,121 @@ const client = new MongoClient(uri, {
     version: ServerApiVersion.v1,
     strict: true,
     deprecationErrors: true,
-  }
+  },
 });
 
 async function run() {
   try {
-   
     await client.connect();
 
-    const database = client.db('resell_hub');
-    const productsCollection = database.collection('products');
-    const reviewsCollection = database.collection('reviews');
-    
+    const database = client.db("resell_hub");
+    const productsCollection = database.collection("products");
+    const reviewsCollection = database.collection("reviews");
+    const wishlistCollection = database.collection("wishlist");
+
     // products related api
     // post a product
-    app.post('/api/products', async (req, res) => {
+    app.post("/api/products", async (req, res) => {
       const product = req.body;
       // console.log(product);
       const result = await productsCollection.insertOne(product);
-      
+
       res.send(result);
-      
     });
 
     // get my products
-    app.get('/api/my-products', async(req,res)=>{
+    app.get("/api/my-products", async (req, res) => {
       const sellerInfo = req.query.sellerInfo;
       const result = await productsCollection.find({ sellerInfo }).toArray();
       res.send(result);
-    })
+    });
     // get all products
-    app.get('/api/products', async(req,res)=>{
+    app.get("/api/products", async (req, res) => {
       const result = await productsCollection.find({}).toArray();
       res.send(result);
-    })
+    });
+
+    // get a single product
+
+    app.get("/api/products/:id", async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+      const result = await productsCollection.findOne(query);
+      res.send(result);
+    });
 
     // edit a product
-    app.patch('/api/products/:id', async(req,res)=>{
+    app.patch("/api/products/:id", async (req, res) => {
       const id = req.params;
       const updatedProduct = req.body;
-      const result = await productsCollection.updateOne({
-        _id: new ObjectId(id)
-      },
-      {
-        $set: updatedProduct
-      })
+      const result = await productsCollection.updateOne(
+        {
+          _id: new ObjectId(id),
+        },
+        {
+          $set: updatedProduct,
+        },
+      );
       res.send(result);
-      })
+    });
 
-     // delete a product
-    app.delete('/api/products/:id', async(req,res)=>{
-      const  id  = req.params;
+    // delete a product
+    app.delete("/api/products/:id", async (req, res) => {
+      const id = req.params;
 
-      const result = await productsCollection.deleteOne({ _id: new ObjectId(id) });
+      const result = await productsCollection.deleteOne({
+        _id: new ObjectId(id),
+      });
       res.send(result);
-    })
+    });
     // get featured products
-    app.get('/api/featured', async(req,res)=>{
+    app.get("/api/featured", async (req, res) => {
       const result = await productsCollection.find({}).limit(6).toArray();
       res.send(result);
-    })
+    });
 
     // reviews related api
     // post review
-    app.post('/api/reviews', async(req, res)=>{
-      const review = req.body
+    app.post("/api/reviews", async (req, res) => {
+      const review = req.body;
       const result = await reviewsCollection.insertOne(review);
-      res.send(result)
-    })
+      res.send(result);
+    });
 
     // get review
-    app.get('/api/reviews', async(req,res)=>{
+    app.get("/api/reviews", async (req, res) => {
       const productId = req.query.productId;
       const result = await reviewsCollection.find({ productId }).toArray();
       res.send(result);
-    })
+    });
+
+    // wishlist relates api
+
+    // add a wishlist item
+
+      app.post("/api/wishlist", async(req, res)=>{
+        const wishlistItem = req.body;
+        const result = await wishlistCollection.insertOne(wishlistItem)
+        res.send(result);
+      })
+
+      // get wishlist items
+
+      // app.get("/api/wishlist", async(req,res)=>{
+      //   const
+      // })
+
+
 
     await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
+    console.log(
+      "Pinged your deployment. You successfully connected to MongoDB!",
+    );
   } finally {
-   
     // await client.close();
   }
 }
 run().catch(console.dir);
-
 
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
