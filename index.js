@@ -30,6 +30,7 @@ async function run() {
     const productsCollection = database.collection("products");
     const reviewsCollection = database.collection("reviews");
     const wishlistCollection = database.collection("wishlist");
+    const paymentsCollection = database.collection("payments");
 
     // products related api
     // post a product
@@ -117,11 +118,13 @@ async function run() {
         res.send(result);
       })
 
-      // get wishlist items
+      // payments history related apis
 
-      // app.get("/api/wishlist", async(req,res)=>{
-      //   const
-      // })
+      app.post("/api/payments", async(req, res)=>{
+        const payment = req.body;
+        const result = await paymentsCollection.insertOne(payment);
+        res.send(result);
+      })
 
 
 
