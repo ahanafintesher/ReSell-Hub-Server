@@ -108,25 +108,56 @@ async function run() {
       res.send(result);
     });
 
+    // get avarage rating of a product
+
+    app.get("/api/reviews/avarage-rating",
+      async (req, res) => {
+        const productId = req.query.productId;
+        const result = await reviewsCollection
+          .aggregate([
+            {
+              $match: { 
+
+                "review.productId": productId,
+
+               },
+            },
+            {
+              $group: {
+                _id: "$review.productId",
+                avarageRating: { $avg: "$review.rating" },
+              },
+            },
+          ])
+          .toArray();
+
+        if (result.length === 0) {
+          return res.send({
+            avarageRating: 0,
+          });
+        }
+        res.send({
+          avarageRating: Number(result[0].avarageRating.toFixed(1)),
+        });
+      });
+
     // wishlist relates api
 
     // add a wishlist item
 
-      app.post("/api/wishlist", async(req, res)=>{
-        const wishlistItem = req.body;
-        const result = await wishlistCollection.insertOne(wishlistItem)
-        res.send(result);
-      })
+    app.post("/api/wishlist", async (req, res) => {
+      const wishlistItem = req.body;
+      const result = await wishlistCollection.insertOne(wishlistItem);
+      res.send(result);
+    });
 
-      // payments history related apis
+    // payments history related apis
 
-      app.post("/api/payments", async(req, res)=>{
-        const payment = req.body;
-        const result = await paymentsCollection.insertOne(payment);
-        res.send(result);
-      })
-
-
+    app.post("/api/payments", async (req, res) => {
+      const payment = req.body;
+      const result = await paymentsCollection.insertOne(payment);
+      res.send(result);
+    });
 
     await client.db("admin").command({ ping: 1 });
     console.log(
