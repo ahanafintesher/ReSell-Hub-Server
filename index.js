@@ -31,6 +31,7 @@ async function run() {
     const reviewsCollection = database.collection("reviews");
     const wishlistCollection = database.collection("wishlist");
     const paymentsCollection = database.collection("payments");
+    const ordersCollection = database.collection("orders")
 
     // products related api
     // post a product
@@ -48,11 +49,17 @@ async function run() {
       const result = await productsCollection.find({ sellerInfo }).toArray();
       res.send(result);
     });
+
+    
+
+
     // get all products
     app.get("/api/products", async (req, res) => {
       const result = await productsCollection.find({}).toArray();
       res.send(result);
     });
+
+
 
     // get a single product
 
@@ -80,11 +87,12 @@ async function run() {
 
     // delete a product
     app.delete("/api/products/:id", async (req, res) => {
-      const id = req.params;
+      const {id} = req.params;
 
       const result = await productsCollection.deleteOne({
         _id: new ObjectId(id),
       });
+     
       res.send(result);
     });
     // get featured products
@@ -104,7 +112,8 @@ async function run() {
     // get review
     app.get("/api/reviews", async (req, res) => {
       const productId = req.query.productId;
-      const result = await reviewsCollection.find({ productId }).toArray();
+      const result = await reviewsCollection.find({ "review.productId": productId }).toArray();
+     
       res.send(result);
     });
 
@@ -140,6 +149,17 @@ async function run() {
           avarageRating: Number(result[0].avarageRating.toFixed(1)),
         });
       });
+
+      // orders related api
+
+      app.post("/api/orders", async(req,res)=>{
+        const orderData = req.body;
+        const result = await ordersCollection.insertOne({
+          ...orderData,
+          createdAt: new Date(),
+        });
+        res.send(result);
+      })
 
     // wishlist relates api
 
