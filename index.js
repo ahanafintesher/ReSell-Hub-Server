@@ -3,7 +3,7 @@ const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
 const app = express();
-const port = 5000;
+const port = process.env.PORT
 const uri = process.env.MONGODB_URI;
 
 app.use(cors());
@@ -31,7 +31,7 @@ async function run() {
     const reviewsCollection = database.collection("reviews");
     const wishlistCollection = database.collection("wishlist");
     const paymentsCollection = database.collection("payments");
-    const ordersCollection = database.collection("orders")
+    const ordersCollection = database.collection("orders");
 
     // products related api
     // post a product
@@ -50,16 +50,11 @@ async function run() {
       res.send(result);
     });
 
-    
-
-
     // get all products
     app.get("/api/products", async (req, res) => {
       const result = await productsCollection.find({}).toArray();
       res.send(result);
     });
-
-
 
     // get a single product
 
@@ -87,12 +82,12 @@ async function run() {
 
     // delete a product
     app.delete("/api/products/:id", async (req, res) => {
-      const {id} = req.params;
+      const { id } = req.params;
 
       const result = await productsCollection.deleteOne({
         _id: new ObjectId(id),
       });
-     
+
       res.send(result);
     });
     // get featured products
@@ -112,54 +107,99 @@ async function run() {
     // get review
     app.get("/api/reviews", async (req, res) => {
       const productId = req.query.productId;
-      const result = await reviewsCollection.find({ "review.productId": productId }).toArray();
-     
+      const result = await reviewsCollection
+        .find({ "review.productId": productId })
+        .toArray();
+
       res.send(result);
     });
 
     // get avarage rating of a product
 
-    app.get("/api/reviews/avarage-rating",
-      async (req, res) => {
-        const productId = req.query.productId;
-        const result = await reviewsCollection
-          .aggregate([
-            {
-              $match: { 
-
-                "review.productId": productId,
-
-               },
+    app.get("/api/reviews/avarage-rating", async (req, res) => {
+      const productId = req.query.productId;
+      const result = await reviewsCollection
+        .aggregate([
+          {
+            $match: {
+              "review.productId": productId,
             },
-            {
-              $group: {
-                _id: "$review.productId",
-                avarageRating: { $avg: "$review.rating" },
-              },
+          },
+          {
+            $group: {
+              _id: "$review.productId",
+              avarageRating: { $avg: "$review.rating" },
             },
-          ])
-          .toArray();
+          },
+        ])
+        .toArray();
 
-        if (result.length === 0) {
-          return res.send({
-            avarageRating: 0,
-          });
-        }
-        res.send({
-          avarageRating: Number(result[0].avarageRating.toFixed(1)),
+      if (result.length === 0) {
+        return res.send({
+          avarageRating: 0,
         });
+      }
+      res.send({
+        avarageRating: Number(result[0].avarageRating.toFixed(1)),
       });
+    });
 
-      // orders related api
+    // orders related api
 
-      app.post("/api/orders", async(req,res)=>{
-        const orderData = req.body;
-        const result = await ordersCollection.insertOne({
-          ...orderData,
-          createdAt: new Date(),
-        });
-        res.send(result);
-      })
+    app.post("/api/orders", async (req, res) => {
+      const orderData = req.body;
+      const result = await ordersCollection.insertOne({
+        ...orderData,
+        createdAt: new Date(),
+      });
+      res.send(result);
+    });
+
+    // get orders by sellerInfo
+
+    app.get("/api/seller/orders", async (req, res) => {
+      const sellerInfo = req.query.sellerInfo;
+      const result = await ordersCollection.find({ sellerInfo }).toArray();
+      res.send(result);
+    });
+
+
+    // get orders by buyerInfo
+
+    app.get("/api/buyer/orders", async(req,res)=>{
+      const buyerInfo = req.query.buyerInfo;
+      console.log(buyerInfo);
+      const result = await ordersCollection.find({ buyerInfo }).toArray();
+      res.send(result);
+    })
+
+   
+
+    // api to edit order status
+    // update order status
+    app.patch("/api/orders/:orderId/status", async (req, res) => {
+      const { orderId } = req.params;
+      const { status } = req.body;
+
+      const allowedStatuses = [
+        "accepted",
+        "rejected",
+        "processing",
+        "shipped",
+        "delivered",
+      ];
+
+      if (!allowedStatuses.includes(status)) {
+        return res.status(400).send({ message: "Invalid status" });
+      }
+
+      const result = await ordersCollection.updateOne(
+        { _id: new ObjectId(orderId) },
+        { $set: { orderStatus: status, updatedAt: new Date() } },
+      );
+
+      res.send(result);
+    });
 
     // wishlist relates api
 
