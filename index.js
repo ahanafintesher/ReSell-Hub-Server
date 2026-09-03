@@ -168,7 +168,6 @@ async function run() {
 
     app.get("/api/buyer/orders", async(req,res)=>{
       const buyerInfo = req.query.buyerInfo;
-      console.log(buyerInfo);
       const result = await ordersCollection.find({ buyerInfo }).toArray();
       res.send(result);
     })
@@ -200,6 +199,14 @@ async function run() {
 
       res.send(result);
     });
+
+    // delete an order
+
+    app.delete("/api/orders/:orderId", async (req, res)=>{
+      const { orderId } = req.params;
+      const result = await ordersCollection.deleteOne({ _id: new ObjectId(orderId)})
+      res.send(result);
+    })
 
     // wishlist relates api
 
