@@ -3,7 +3,7 @@ const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
 const app = express();
-const port = process.env.PORT
+const port = process.env.PORT;
 const uri = process.env.MONGODB_URI;
 
 app.use(cors());
@@ -163,16 +163,13 @@ async function run() {
       res.send(result);
     });
 
-
     // get orders by buyerInfo
 
-    app.get("/api/buyer/orders", async(req,res)=>{
+    app.get("/api/buyer/orders", async (req, res) => {
       const buyerInfo = req.query.buyerInfo;
       const result = await ordersCollection.find({ buyerInfo }).toArray();
       res.send(result);
-    })
-
-   
+    });
 
     // api to edit order status
     // update order status
@@ -202,19 +199,63 @@ async function run() {
 
     // delete an order
 
-    app.delete("/api/orders/:orderId", async (req, res)=>{
+    app.delete("/api/orders/:orderId", async (req, res) => {
       const { orderId } = req.params;
-      const result = await ordersCollection.deleteOne({ _id: new ObjectId(orderId)})
+      const result = await ordersCollection.deleteOne({
+        _id: new ObjectId(orderId),
+      });
       res.send(result);
-    })
+    });
 
     // wishlist relates api
 
-    // add a wishlist item
+    // get wishlist items by user
+    app.get("/api/wishlist", async (req, res) => {
+      const userInfo = req.query.userInfo;
 
+      if (!userInfo) {
+        return res.status(400).send({
+          message: "userInfo is required",
+        });
+      }
+
+      const result = await wishlistCollection.find({ userInfo }).toArray();
+
+      res.send(result);
+    });
+
+    // add a wishlist item
     app.post("/api/wishlist", async (req, res) => {
-      const wishlistItem = req.body;
-      const result = await wishlistCollection.insertOne(wishlistItem);
+      const { product, userInfo } = req.body;
+
+      const existingItem = await wishlistCollection.findOne({
+        "product._id": product._id,
+        userInfo,
+      });
+
+      if (existingItem) {
+        return res.status(409).send({
+          message: "Product already exists in wishlist",
+        });
+      }
+
+      const result = await wishlistCollection.insertOne({
+        product,
+        userInfo,
+        createdAt: new Date(),
+      });
+
+      res.send(result);
+    });
+
+    // remove wishlist item
+    app.delete("/api/wishlist/:id", async (req, res) => {
+      const { id } = req.params;
+
+      const result = await wishlistCollection.deleteOne({
+        _id: new ObjectId(id),
+      });
+
       res.send(result);
     });
 
@@ -226,6 +267,24 @@ async function run() {
       res.send(result);
     });
 
+   app.get("/api/payments", async (req, res) => {
+  const userEmail = req.query.userEmail;
+
+  if (!userEmail) {
+    return res.status(400).send({
+      message: "userEmail is required",
+    });
+  }
+
+  const result = await paymentsCollection
+    .find({
+      "metadata.userEmail": userEmail,
+    })
+    .sort({ date: -1 })
+    .toArray();
+
+  res.send(result);
+});
     await client.db("admin").command({ ping: 1 });
     console.log(
       "Pinged your deployment. You successfully connected to MongoDB!",
