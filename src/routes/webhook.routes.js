@@ -5,6 +5,9 @@ const { getStripeInstance } = require("../config/stripe");
 
 const router = express.Router();
 
+// In-flight sessions set to prevent concurrent duplicate webhook execution
+const inFlightSessions = new Set();
+
 /**
  * STRIPE WEBHOOK API (Raw Body Handler)
  * Registered before express.json() to preserve unmodified raw body Buffer
@@ -67,6 +70,16 @@ router.post(
         .json({ error: "Service unavailable: Database not connected" });
     }
 
+    const sessionId = event.data?.object?.id;
+    if (sessionId && inFlightSessions.has(sessionId)) {
+      return res
+        .status(200)
+        .json({ received: true, message: "Webhook event currently processing" });
+    }
+    if (sessionId) {
+      inFlightSessions.add(sessionId);
+    }
+
     try {
       switch (event.type) {
         case "checkout.session.completed": {
@@ -82,30 +95,30 @@ router.post(
               .json({ received: true, status: session.payment_status });
           }
 
-          const sessionId = session.id;
+          const currentSessionId = session.id;
           const paymentIntentId = session.payment_intent || null;
           const metadata = session.metadata || {};
           const productId = metadata.productId;
 
           // 1. Idempotency Check: check if already processed in payments or orders
           const existingPayment =
-            (await paymentsCollection.findOne({ session_id: sessionId })) ||
+            (await paymentsCollection.findOne({ session_id: currentSessionId })) ||
             (paymentIntentId
               ? await paymentsCollection.findOne({
                   transactionId: paymentIntentId,
                 })
               : null) ||
-            (await paymentsCollection.findOne({ transactionId: sessionId }));
+            (await paymentsCollection.findOne({ transactionId: currentSessionId }));
 
           const existingOrder =
-            (await ordersCollection.findOne({ paymentId: sessionId })) ||
+            (await ordersCollection.findOne({ paymentId: currentSessionId })) ||
             (paymentIntentId
               ? await ordersCollection.findOne({ paymentId: paymentIntentId })
               : null);
 
           if (existingPayment && existingOrder) {
             console.log(
-              `Stripe webhook: Session ${sessionId} already processed (idempotent skip)`
+              `Stripe webhook: Session ${currentSessionId} already processed (idempotent skip)`
             );
             return res
               .status(200)
@@ -135,7 +148,7 @@ router.post(
               console.error(
                 "Stripe webhook security error: Price mismatch detected",
                 {
-                  sessionId,
+                  sessionId: currentSessionId,
                   paidCents: session.amount_total,
                   expectedCents: expectedAmountCents,
                   productId,
@@ -180,6 +193,27 @@ router.post(
           const productTitle =
             product?.title || metadata.title || "Untitled Product";
 
+          // 2.5 Duplicate Purchase / Competing Webhook Guard:
+          // Check if product was already purchased by another customer
+          let isDoubleSale = false;
+          if (productId && ordersCollection) {
+            const existingProductOrder = await ordersCollection.findOne({
+              productId: String(productId),
+              paymentStatus: "paid",
+              orderStatus: { $nin: ["cancelled", "rejected"] },
+            });
+            if (
+              existingProductOrder &&
+              existingProductOrder.paymentId !== currentSessionId &&
+              (!paymentIntentId || existingProductOrder.transactionId !== paymentIntentId)
+            ) {
+              isDoubleSale = true;
+              console.warn(
+                `Stripe webhook WARNING: Duplicate purchase attempt detected for product ${productId}. Session ${currentSessionId} paid for already sold item.`
+              );
+            }
+          }
+
           // 3. Insert or update order
           let orderId = null;
           if (existingOrder) {
@@ -192,17 +226,21 @@ router.post(
             }
           } else {
             const orderDoc = {
-              paymentId: sessionId,
-              transactionId: paymentIntentId || sessionId,
+              paymentId: currentSessionId,
+              transactionId: paymentIntentId || currentSessionId,
               productId: productId || (product ? product._id.toString() : null),
               productTitle,
               price: authoritativePrice,
+              currency: session.currency || "usd",
               sellerName,
               sellerInfo,
               buyerName,
               buyerInfo: buyerEmail,
               paymentStatus: "paid",
-              orderStatus: "pending",
+              orderStatus: isDoubleSale ? "rejected" : "pending",
+              rejectionReason: isDoubleSale
+                ? "Product already sold to another customer. Automatic refund required."
+                : undefined,
               createdAt: new Date(),
             };
             const orderResult = await ordersCollection.insertOne(orderDoc);
@@ -212,8 +250,8 @@ router.post(
           // 4. Insert payment record if not existing
           if (!existingPayment) {
             const paymentDoc = {
-              session_id: sessionId,
-              transactionId: paymentIntentId || sessionId,
+              session_id: currentSessionId,
+              transactionId: paymentIntentId || currentSessionId,
               orderId,
               amount:
                 session.amount_total != null
@@ -221,30 +259,78 @@ router.post(
                   : authoritativePrice,
               currency: session.currency || "usd",
               paymentStatus: "paid",
+              fulfillmentStatus: isDoubleSale ? "failed_duplicate_purchase" : "fulfilled",
               metadata: {
                 ...metadata,
                 userEmail: buyerEmail,
               },
+              buyerEmail,
+              userEmail: buyerEmail,
               date: new Date().toISOString(),
               createdAt: new Date(),
             };
             await paymentsCollection.insertOne(paymentDoc);
           }
 
-          // 5. Update product status to sold in database
-          if (productsCollection && productId) {
+          // 5. Update product status to sold in database (only if not already sold to another buyer)
+          if (!isDoubleSale && productsCollection && productId) {
             const productQuery = ObjectId.isValid(productId)
               ? { _id: new ObjectId(productId) }
               : { _id: productId };
             await productsCollection.updateOne(productQuery, {
-              $set: { status: "sold", updatedAt: new Date() },
+              $set: {
+                status: "sold",
+                soldTo: buyerEmail,
+                soldPaymentId: currentSessionId,
+                updatedAt: new Date(),
+              },
+              $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "" },
             });
           }
 
           console.log(
-            `Stripe webhook: Successfully processed checkout.session.completed for session ${sessionId}`
+            `Stripe webhook: Successfully processed checkout.session.completed for session ${currentSessionId}${isDoubleSale ? " (flagged duplicate sale)" : ""}`
           );
-          return res.status(200).json({ received: true });
+          return res.status(200).json({ received: true, doubleSale: isDoubleSale });
+        }
+
+        case "checkout.session.expired": {
+          const session = event.data.object;
+          const productId = session.metadata?.productId;
+          if (productId && productsCollection) {
+            const productQuery = ObjectId.isValid(productId)
+              ? { _id: new ObjectId(productId) }
+              : { _id: productId };
+            await productsCollection.updateOne(
+              {
+                ...productQuery,
+                reservationSessionId: session.id,
+              },
+              {
+                $set: { status: "available", updatedAt: new Date() },
+                $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "" },
+              }
+            );
+          }
+          return res.status(200).json({ received: true, status: "expired" });
+        }
+
+        case "payment_intent.payment_failed": {
+          const intent = event.data.object;
+          if (paymentsCollection) {
+            await paymentsCollection.updateOne(
+              { transactionId: intent.id },
+              {
+                $set: {
+                  paymentStatus: "failed",
+                  failureReason:
+                    intent.last_payment_error?.message || "Payment failed",
+                  updatedAt: new Date(),
+                },
+              }
+            );
+          }
+          return res.status(200).json({ received: true, status: "failed" });
         }
 
         default:
@@ -257,6 +343,10 @@ router.post(
         processError.message || processError
       );
       return res.status(500).json({ error: "Failed to process webhook event" });
+    } finally {
+      if (sessionId) {
+        inFlightSessions.delete(sessionId);
+      }
     }
   }
 );

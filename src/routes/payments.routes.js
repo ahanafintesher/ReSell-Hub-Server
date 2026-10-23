@@ -8,7 +8,7 @@ const {
   requireRole,
   validateUserIdentity,
 } = require("../middleware/auth");
-const { extractEmail } = require("../utils/helpers");
+const { extractEmail, escapeRegex } = require("../utils/helpers");
 
 const router = express.Router();
 
@@ -69,10 +69,12 @@ router.post(
 );
 
 // Get payment history (Buyer / Admin)
+// Non-admin users are strictly restricted to their own payment records.
+// Admin users can monitor platform-wide transactions or filter by userEmail.
 router.get(
   "/api/payments",
   verifyToken,
-  requireRole("buyer", "admin"),
+  requireRole("buyer", "seller", "admin"),
   async (req, res) => {
     try {
       const { paymentsCollection } = getCollections();
@@ -82,18 +84,94 @@ router.get(
           .send({ message: "Service Unavailable: Database not connected" });
       }
 
-      const userEmail =
-        req.user.role === "admin" && req.query.userEmail
-          ? req.query.userEmail
-          : req.user.email;
+      const query = {};
+      const isAdmin = req.user.role === "admin";
 
-      const result = await paymentsCollection
-        .find({
-          "metadata.userEmail": userEmail,
-        })
-        .sort({ date: -1 })
-        .toArray();
+      let userMatch = null;
+      if (isAdmin) {
+        // Admin can optionally filter by userEmail or view all platform payments
+        if (req.query.userEmail && typeof req.query.userEmail === "string") {
+          userMatch = {
+            $or: [
+              { "metadata.userEmail": req.query.userEmail.trim() },
+              { userEmail: req.query.userEmail.trim() },
+              { buyerEmail: req.query.userEmail.trim() },
+            ],
+          };
+        }
+      } else {
+        // Non-admin users are strictly bound to their authenticated principal email
+        userMatch = {
+          $or: [
+            { "metadata.userEmail": req.user.email },
+            { userEmail: req.user.email },
+            { buyerEmail: req.user.email },
+            { "metadata.buyerEmail": req.user.email },
+          ],
+        };
+      }
 
+      // Filter by payment status if supplied
+      const statusParam = req.query.status || req.query.paymentStatus;
+      if (statusParam && typeof statusParam === "string") {
+        query.paymentStatus = statusParam.trim();
+      }
+
+      // Search by transactionId or session_id
+      const search = req.query.search || req.query.q;
+      let searchMatch = null;
+      if (search && typeof search === "string" && search.trim()) {
+        const escaped = escapeRegex(search.trim());
+        searchMatch = {
+          $or: [
+            { transactionId: { $regex: escaped, $options: "i" } },
+            { session_id: { $regex: escaped, $options: "i" } },
+            { "metadata.userEmail": { $regex: escaped, $options: "i" } },
+            { userEmail: { $regex: escaped, $options: "i" } },
+          ],
+        };
+      }
+
+      if (userMatch && searchMatch) {
+        query.$and = [userMatch, searchMatch];
+      } else if (userMatch) {
+        Object.assign(query, userMatch);
+      } else if (searchMatch) {
+        Object.assign(query, searchMatch);
+      }
+
+      let cursor = paymentsCollection.find(query).sort({ date: -1, createdAt: -1 });
+
+      // Pagination support
+      const isPaginated = Boolean(req.query.page || req.query.limit);
+      if (isPaginated) {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 10));
+        const skip = (page - 1) * limit;
+
+        const allMatching = await paymentsCollection.find(query).toArray();
+        const total = allMatching.length;
+        const totalRevenue = allMatching.reduce(
+          (sum, p) => sum + (p.paymentStatus === "paid" ? Number(p.amount) || 0 : 0),
+          0
+        );
+
+        if (typeof cursor.skip === "function") cursor = cursor.skip(skip);
+        if (typeof cursor.limit === "function") cursor = cursor.limit(limit);
+
+        const payments = await cursor.toArray();
+        return res.status(200).json({
+          payments,
+          total,
+          page,
+          limit,
+          totalPages: Math.ceil(total / limit) || 1,
+          totalRevenue,
+        });
+      }
+
+      const result = await cursor.toArray();
+      res.set("X-Total-Count", String(result.length));
       res.send(result);
     } catch (error) {
       console.error("Get payments error:", error.message || error);
@@ -137,6 +215,18 @@ router.post(
         return res.status(400).json({ message: "Product is already sold" });
       }
 
+      // Moderation status check: pending and rejected products cannot be checked out
+      if (
+        product.status === "pending" ||
+        product.status === "rejected" ||
+        product.moderationStatus === "pending" ||
+        product.moderationStatus === "rejected"
+      ) {
+        return res
+          .status(400)
+          .json({ message: "Product is not approved for purchase" });
+      }
+
       const authoritativePrice = Number(product.price);
       if (isNaN(authoritativePrice) || authoritativePrice <= 0) {
         return res
@@ -152,6 +242,31 @@ router.post(
           .json({ message: "You cannot purchase your own product" });
       }
 
+      // Check seller account is not blocked
+      const { usersCollection } = getCollections();
+      if (usersCollection && sellerEmail) {
+        const seller = await usersCollection.findOne({ email: sellerEmail });
+        if (seller && seller.status === "blocked") {
+          return res.status(400).json({
+            message: "Seller account is blocked; product is unavailable",
+          });
+        }
+      }
+
+      // Concurrency & Reservation check: prevent competing checkout sessions
+      const now = new Date();
+      const isReservedByOther =
+        product.reservedUntil &&
+        new Date(product.reservedUntil) > now &&
+        product.reservedBy !== req.user.email;
+
+      if (isReservedByOther) {
+        return res.status(409).json({
+          message:
+            "This product is currently reserved by another buyer in checkout. Please try again shortly.",
+        });
+      }
+
       const stripe = getStripeInstance();
       const origin =
         req.headers.origin ||
@@ -159,12 +274,14 @@ router.post(
         config.JWT_ISSUER ||
         "http://localhost:3000";
 
+      const currency = (config.CURRENCY || "usd").toLowerCase();
+
       const session = await stripe.checkout.sessions.create({
         payment_method_types: ["card"],
         line_items: [
           {
             price_data: {
-              currency: "usd",
+              currency,
               product_data: {
                 name: product.title || "Marketplace Product",
                 images:
@@ -185,10 +302,23 @@ router.post(
           productId: String(product._id),
           title: product.title || "Product",
           price: String(authoritativePrice),
+          currency,
           userEmail: req.user.email,
           buyerName: req.user.name || "Buyer",
           sellerInfo: sellerEmail || String(product.sellerInfo || "unknown"),
           sellerName: product.sellerName || "Seller",
+        },
+      });
+
+      // Atomically reserve the product for 30 minutes
+      const reservationExpiry = new Date(Date.now() + 30 * 60 * 1000);
+      await productsCollection.updateOne(productQuery, {
+        $set: {
+          status: "reserved",
+          reservedBy: req.user.email,
+          reservedUntil: reservationExpiry,
+          reservationSessionId: session.id,
+          updatedAt: new Date(),
         },
       });
 

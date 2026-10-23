@@ -23,6 +23,7 @@ const collections = {
   paymentsCollection: null,
   ordersCollection: null,
   usersCollection: null,
+  reportsCollection: null,
 };
 
 function getCollections() {
@@ -44,6 +45,8 @@ function setCollections(newCollections) {
     collections.ordersCollection = newCollections.ordersCollection;
   if ("usersCollection" in newCollections)
     collections.usersCollection = newCollections.usersCollection;
+  if ("reportsCollection" in newCollections)
+    collections.reportsCollection = newCollections.reportsCollection;
 }
 
 /**
@@ -77,6 +80,11 @@ async function createIndexes() {
     if (collections.usersCollection && typeof collections.usersCollection.createIndex === "function") {
       await collections.usersCollection.createIndex({ email: 1 });
     }
+    if (collections.reportsCollection && typeof collections.reportsCollection.createIndex === "function") {
+      await collections.reportsCollection.createIndex({ productId: 1 });
+      await collections.reportsCollection.createIndex({ reporterEmail: 1 });
+      await collections.reportsCollection.createIndex({ status: 1 });
+    }
   } catch (indexErr) {
     // Indexes are safe optimizations; don't crash if database has restricted index privileges
     console.warn("Index initialization notice:", indexErr.message);
@@ -98,6 +106,7 @@ async function run() {
     collections.paymentsCollection = collections.database.collection("payments");
     collections.ordersCollection = collections.database.collection("orders");
     collections.usersCollection = collections.database.collection("user");
+    collections.reportsCollection = collections.database.collection("reports");
 
     await client.db("admin").command({ ping: 1 });
     console.log(

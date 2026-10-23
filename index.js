@@ -23,6 +23,9 @@ const paymentsRoutes = require("./src/routes/payments.routes");
 const reviewsRoutes = require("./src/routes/reviews.routes");
 const wishlistRoutes = require("./src/routes/wishlist.routes");
 const adminRoutes = require("./src/routes/admin.routes");
+const publicRoutes = require("./src/routes/public.routes");
+const usersRoutes = require("./src/routes/users.routes");
+const sellerRoutes = require("./src/routes/seller.routes");
 
 // Validate environment variables on startup without exposing secret values
 validateEnv();
@@ -48,6 +51,9 @@ app.get("/", (req, res) => {
 });
 
 // Mount domain routes
+app.use(publicRoutes);
+app.use(usersRoutes);
+app.use(sellerRoutes);
 app.use(productsRoutes);
 app.use(ordersRoutes);
 app.use(paymentsRoutes);

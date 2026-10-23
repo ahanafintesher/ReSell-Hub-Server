@@ -6,7 +6,11 @@ const {
   requireRole,
   validateUserIdentity,
 } = require("../middleware/auth");
-const { extractEmail, escapeRegex } = require("../utils/helpers");
+const {
+  extractEmail,
+  escapeRegex,
+  sanitizeSellerPublicInfo,
+} = require("../utils/helpers");
 
 const router = express.Router();
 
@@ -72,7 +76,7 @@ router.post(
   }
 );
 
-// Get my products (Seller / Admin)
+// Get my products (Seller / Admin) - supports both string and object sellerInfo schemas
 router.get(
   "/api/my-products",
   verifyToken,
@@ -86,13 +90,15 @@ router.get(
           .send({ message: "Service Unavailable: Database not connected" });
       }
 
-      const sellerInfo =
+      const sellerEmail =
         req.user.role === "admin" && req.query.sellerInfo
-          ? req.query.sellerInfo
+          ? req.query.sellerInfo.trim()
           : req.user.email;
 
       const result = await productsCollection
-        .find({ sellerInfo })
+        .find({
+          $or: [{ sellerInfo: sellerEmail }, { "sellerInfo.email": sellerEmail }],
+        })
         .toArray();
       res.send(result);
     } catch (error) {
@@ -133,9 +139,12 @@ router.get("/api/products", async (req, res) => {
       query.condition = req.query.condition.trim();
     }
 
-    // 4. Filter by status (optional)
+    // 4. Filter by status. By default, hide rejected products from public view
     if (req.query.status && typeof req.query.status === "string") {
       query.status = req.query.status.trim();
+    } else {
+      query.status = { $nin: ["rejected"] };
+      query.moderationStatus = { $ne: "rejected" };
     }
 
     // 5. Filter by price range
@@ -163,11 +172,18 @@ router.get("/api/products", async (req, res) => {
       }
     }
 
-    // 7. Pagination
-    if (req.query.page || req.query.limit) {
+    // 7. Bounded Pagination
+    const isPaginated = Boolean(req.query.page || req.query.limit);
+
+    if (isPaginated) {
       const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-      const limit = Math.max(1, parseInt(req.query.limit, 10) || 10);
+      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 10));
       const skip = (page - 1) * limit;
+
+      const total =
+        typeof productsCollection.countDocuments === "function"
+          ? await productsCollection.countDocuments(query)
+          : (await productsCollection.find(query).toArray()).length;
 
       if (typeof cursor.skip === "function") {
         cursor = cursor.skip(skip);
@@ -175,13 +191,101 @@ router.get("/api/products", async (req, res) => {
       if (typeof cursor.limit === "function") {
         cursor = cursor.limit(limit);
       }
+
+      const products = await cursor.toArray();
+      const sanitizedProducts = products.map((p) => ({
+        ...p,
+        sellerInfo: sanitizeSellerPublicInfo(p.sellerInfo),
+      }));
+
+      return res.status(200).json({
+        products: sanitizedProducts,
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit) || 1,
+      });
     }
 
-    const result = await cursor.toArray();
+    const rawList = await cursor.toArray();
+    const result = rawList.map((p) => ({
+      ...p,
+      sellerInfo: sanitizeSellerPublicInfo(p.sellerInfo),
+    }));
+    res.set("X-Total-Count", String(result.length));
     res.send(result);
   } catch (error) {
     console.error("Get products error:", error.message || error);
     res.status(500).send({ message: "Failed to fetch products" });
+  }
+});
+
+// Report a product (Authenticated)
+router.post("/api/products/:id/report", verifyToken, async (req, res) => {
+  try {
+    if (!validateUserIdentity(req, res)) return;
+
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid product ID format" });
+    }
+
+    const { reason, description } = req.body || {};
+    if (!reason || typeof reason !== "string" || !reason.trim()) {
+      return res.status(400).json({ message: "Report reason is required" });
+    }
+
+    const { productsCollection, reportsCollection } = getCollections();
+    if (!productsCollection) {
+      return res
+        .status(503)
+        .json({ message: "Service Unavailable: Database not connected" });
+    }
+
+    const product = await productsCollection.findOne({ _id: new ObjectId(id) });
+    if (!product) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    if (reportsCollection) {
+      // Prevent duplicate report spam from the same user for the same product
+      const existingReport = await reportsCollection.findOne({
+        productId: id,
+        reporterEmail: req.user.email,
+        status: "pending",
+      });
+      if (existingReport) {
+        return res.status(409).json({
+          message: "You have already submitted a pending report for this product",
+        });
+      }
+
+      const reportDoc = {
+        productId: id,
+        productTitle: product.title || "Untitled Product",
+        sellerInfo: extractEmail(product.sellerInfo) || product.sellerInfo,
+        reporterEmail: req.user.email,
+        reason: reason.trim(),
+        description: typeof description === "string" ? description.trim() : "",
+        status: "pending",
+        createdAt: new Date(),
+      };
+
+      const result = await reportsCollection.insertOne(reportDoc);
+      return res.status(201).json({
+        success: true,
+        message: "Product reported successfully",
+        reportId: result.insertedId,
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Report received",
+    });
+  } catch (error) {
+    console.error("Report product error:", error.message || error);
+    res.status(500).json({ message: "Failed to report product" });
   }
 });
 
@@ -195,7 +299,19 @@ router.get("/api/featured", async (req, res) => {
         .send({ message: "Service Unavailable: Database not connected" });
     }
 
-    const result = await productsCollection.find({}).limit(6).toArray();
+    const raw = await productsCollection
+      .find({
+        status: { $nin: ["sold", "rejected"] },
+        moderationStatus: { $ne: "rejected" },
+      })
+      .limit(6)
+      .toArray();
+
+    const result = raw.map((p) => ({
+      ...p,
+      sellerInfo: sanitizeSellerPublicInfo(p.sellerInfo),
+    }));
+
     res.send(result);
   } catch (error) {
     console.error("Get featured products error:", error.message || error);
@@ -223,7 +339,12 @@ router.get("/api/products/:id", async (req, res) => {
     if (!result) {
       return res.status(404).send({ message: "Product not found" });
     }
-    res.send(result);
+
+    const sanitized = {
+      ...result,
+      sellerInfo: sanitizeSellerPublicInfo(result.sellerInfo),
+    };
+    res.send(sanitized);
   } catch (error) {
     console.error("Get single product error:", error.message || error);
     res.status(500).send({ message: "Failed to fetch product" });

@@ -35,12 +35,35 @@ const toObjectIdQuery = (id) => {
 
 /**
  * Escapes regex special characters to prevent ReDoS or query injection when searching by name/category.
+ * Truncates search query to maxLength to prevent memory and ReDoS exhaustion.
  * @param {string} str
+ * @param {number} maxLength
  * @returns {string}
  */
-const escapeRegex = (str) => {
+const escapeRegex = (str, maxLength = 100) => {
   if (typeof str !== "string") return "";
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const trimmed = str.trim().slice(0, maxLength);
+  return trimmed.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+};
+
+/**
+ * Sanitizes sellerInfo for public presentation, ensuring phone numbers, passwords,
+ * and internal authentication keys are never leaked to unauthenticated scrapers.
+ * @param {string|object} sellerInfo
+ * @returns {string|object}
+ */
+const sanitizeSellerPublicInfo = (sellerInfo) => {
+  if (!sellerInfo) return null;
+  if (typeof sellerInfo === "string") {
+    return sellerInfo;
+  }
+  if (typeof sellerInfo === "object") {
+    return {
+      name: sellerInfo.name || "Seller",
+      email: sellerInfo.email || undefined,
+    };
+  }
+  return String(sellerInfo);
 };
 
 module.exports = {
@@ -48,4 +71,5 @@ module.exports = {
   isValidObjectId,
   toObjectIdQuery,
   escapeRegex,
+  sanitizeSellerPublicInfo,
 };

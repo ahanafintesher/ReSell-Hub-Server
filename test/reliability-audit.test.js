@@ -98,12 +98,26 @@ function createEnhancedMockCollection(initialData = []) {
             if (!re.test(d[key] || "")) return false;
           } else if (
             filter[key] &&
-            typeof filter[key] === "object" &&
-            ("$gte" in filter[key] || "$lte" in filter[key])
+            typeof filter[key] === "object"
           ) {
-            const val = Number(d[key]);
-            if ("$gte" in filter[key] && val < filter[key].$gte) return false;
-            if ("$lte" in filter[key] && val > filter[key].$lte) return false;
+            const expected = filter[key];
+            if ("$ne" in expected && d[key] === expected.$ne) return false;
+            if (
+              "$nin" in expected &&
+              Array.isArray(expected.$nin) &&
+              expected.$nin.includes(d[key])
+            ) {
+              return false;
+            }
+            if (
+              "$in" in expected &&
+              Array.isArray(expected.$in) &&
+              !expected.$in.includes(d[key])
+            ) {
+              return false;
+            }
+            if ("$gte" in expected && Number(d[key]) < expected.$gte) return false;
+            if ("$lte" in expected && Number(d[key]) > expected.$lte) return false;
           } else if (key.includes(".")) {
             const parts = key.split(".");
             let val = d;

@@ -25,10 +25,13 @@ function validateEnv() {
     missingRecommended.push("ALLOWED_ORIGINS");
   }
 
-  if (missingRequired.length > 0 && process.env.NODE_ENV !== "test") {
-    console.warn(
-      `[CONFIG WARNING] Missing required environment variables: ${missingRequired.join(", ")}`
-    );
+  if (missingRequired.length > 0) {
+    const errorMsg = `[CONFIG FATAL] Missing required environment variables: ${missingRequired.join(", ")}`;
+    if (isProduction) {
+      throw new Error(errorMsg);
+    } else if (process.env.NODE_ENV !== "test") {
+      console.warn(errorMsg);
+    }
   }
 
   if (missingRecommended.length > 0 && isProduction) {
@@ -61,6 +64,7 @@ const config = {
     : null,
   STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || "",
   STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET || "",
+  CURRENCY: (process.env.STRIPE_CURRENCY || process.env.CURRENCY || "usd").toLowerCase(),
 };
 
 module.exports = {
