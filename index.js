@@ -2,11 +2,27 @@ const express = require("express");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const { createRemoteJWKSet, jwtVerify } = require("jose-cjs");
+const Stripe = require("stripe");
 require("dotenv").config();
 
 const app = express();
 const port = process.env.PORT || 5000;
 const uri = process.env.MONGODB_URI;
+
+// Stripe instance initialized with secret key from environment
+let stripeInstance = new Stripe(process.env.STRIPE_SECRET_KEY || "");
+const setStripeInstance = (instance) => {
+  stripeInstance = instance;
+};
+
+// Database and collection references (declared before route closures)
+let database;
+let productsCollection;
+let reviewsCollection;
+let wishlistCollection;
+let paymentsCollection;
+let ordersCollection;
+let usersCollection;
 
 // Middleware
 app.use(
@@ -15,9 +31,254 @@ app.use(
       ? process.env.ALLOWED_ORIGINS.split(",")
       : true,
     credentials: true,
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization", "stripe-signature"],
   })
 );
+
+// ──────────────────────────────────────────
+// STRIPE WEBHOOK API (Raw Body Handler)
+// MUST be registered BEFORE express.json() to preserve unmodified raw body Buffer
+// ──────────────────────────────────────────
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "*/*" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!webhookSecret) {
+      console.error(
+        "Stripe webhook configuration error: STRIPE_WEBHOOK_SECRET is not configured"
+      );
+      return res
+        .status(500)
+        .json({ error: "Webhook secret is not configured" });
+    }
+
+    if (!sig) {
+      console.error(
+        "Stripe webhook verification error: Missing stripe-signature header"
+      );
+      return res
+        .status(400)
+        .json({ error: "Missing stripe-signature header" });
+    }
+
+    if (!req.body || (Buffer.isBuffer(req.body) && req.body.length === 0)) {
+      console.error("Stripe webhook error: Empty request payload");
+      return res.status(400).json({ error: "Empty request payload" });
+    }
+
+    let event;
+    try {
+      event = stripeInstance.webhooks.constructEvent(
+        req.body,
+        sig,
+        webhookSecret
+      );
+    } catch (err) {
+      console.error(
+        "Stripe webhook signature verification failed:",
+        err.message
+      );
+      return res.status(400).json({
+        error: `Webhook signature verification failed: ${err.message}`,
+      });
+    }
+
+    // Ensure database connection is ready
+    if (!paymentsCollection || !ordersCollection) {
+      console.error("Stripe webhook error: Database collections not ready");
+      return res
+        .status(503)
+        .json({ error: "Service unavailable: Database not connected" });
+    }
+
+    try {
+      switch (event.type) {
+        case "checkout.session.completed": {
+          const session = event.data.object;
+
+          // Only process paid checkout sessions
+          if (session.payment_status !== "paid") {
+            console.log(
+              `Stripe webhook: Checkout session ${session.id} payment_status is '${session.payment_status}', skipping order creation`
+            );
+            return res
+              .status(200)
+              .json({ received: true, status: session.payment_status });
+          }
+
+          const sessionId = session.id;
+          const paymentIntentId = session.payment_intent || null;
+          const metadata = session.metadata || {};
+          const productId = metadata.productId;
+
+          // 1. Idempotency Check: check if already processed in payments or orders
+          const existingPayment =
+            (await paymentsCollection.findOne({ session_id: sessionId })) ||
+            (paymentIntentId
+              ? await paymentsCollection.findOne({ transactionId: paymentIntentId })
+              : null) ||
+            (await paymentsCollection.findOne({ transactionId: sessionId }));
+
+          const existingOrder =
+            (await ordersCollection.findOne({ paymentId: sessionId })) ||
+            (paymentIntentId
+              ? await ordersCollection.findOne({ paymentId: paymentIntentId })
+              : null);
+
+          if (existingPayment && existingOrder) {
+            console.log(
+              `Stripe webhook: Session ${sessionId} already processed (idempotent skip)`
+            );
+            return res
+              .status(200)
+              .json({ received: true, message: "Already processed" });
+          }
+
+          // 2. Retrieve authoritative product & price from database
+          let product = null;
+          if (productsCollection && productId) {
+            const productQuery = ObjectId.isValid(productId)
+              ? { _id: new ObjectId(productId) }
+              : { _id: productId };
+            product = await productsCollection.findOne(productQuery);
+          }
+
+          // Authoritative price check
+          let authoritativePrice;
+          if (product && product.price != null) {
+            authoritativePrice = Number(product.price);
+            const expectedAmountCents = Math.round(authoritativePrice * 100);
+
+            // Security check: Validate against client-manipulated amount in session
+            if (
+              session.amount_total != null &&
+              session.amount_total < expectedAmountCents
+            ) {
+              console.error(
+                "Stripe webhook security error: Price mismatch detected",
+                {
+                  sessionId,
+                  paidCents: session.amount_total,
+                  expectedCents: expectedAmountCents,
+                  productId,
+                }
+              );
+              return res.status(400).json({
+                error:
+                  "Security validation error: Paid amount does not match authoritative price",
+              });
+            }
+          } else if (metadata.price != null && !isNaN(Number(metadata.price))) {
+            authoritativePrice = Number(metadata.price);
+          } else if (session.amount_total != null) {
+            authoritativePrice = session.amount_total / 100;
+          } else {
+            authoritativePrice = 0;
+          }
+
+          const buyerEmail =
+            metadata.userEmail ||
+            session.customer_details?.email ||
+            session.customer_email ||
+            "unknown@example.com";
+
+          const buyerName =
+            metadata.buyerName ||
+            session.customer_details?.name ||
+            "Anonymous";
+
+          const sellerInfo = product
+            ? typeof product.sellerInfo === "object"
+              ? product.sellerInfo?.email || product.sellerInfo
+              : product.sellerInfo || "not found"
+            : metadata.sellerInfo || "not found";
+
+          const sellerName =
+            product?.sellerName ||
+            (typeof product?.sellerInfo === "object"
+              ? product?.sellerInfo?.name
+              : metadata.sellerName || "N/A");
+
+          const productTitle =
+            product?.title || metadata.title || "Untitled Product";
+
+          // 3. Insert or update order
+          let orderId = null;
+          if (existingOrder) {
+            orderId = existingOrder._id;
+            if (existingOrder.paymentStatus !== "paid") {
+              await ordersCollection.updateOne(
+                { _id: existingOrder._id },
+                { $set: { paymentStatus: "paid", updatedAt: new Date() } }
+              );
+            }
+          } else {
+            const orderDoc = {
+              paymentId: sessionId,
+              transactionId: paymentIntentId || sessionId,
+              productId: productId || (product ? product._id.toString() : null),
+              productTitle,
+              price: authoritativePrice,
+              sellerName,
+              sellerInfo,
+              buyerName,
+              buyerInfo: buyerEmail,
+              paymentStatus: "paid",
+              orderStatus: "pending",
+              createdAt: new Date(),
+            };
+            const orderResult = await ordersCollection.insertOne(orderDoc);
+            orderId = orderResult.insertedId;
+          }
+
+          // 4. Insert payment record if not existing
+          if (!existingPayment) {
+            const paymentDoc = {
+              session_id: sessionId,
+              transactionId: paymentIntentId || sessionId,
+              orderId,
+              amount:
+                session.amount_total != null
+                  ? session.amount_total / 100
+                  : authoritativePrice,
+              currency: session.currency || "usd",
+              paymentStatus: "paid",
+              metadata: {
+                ...metadata,
+                userEmail: buyerEmail,
+              },
+              date: new Date().toISOString(),
+              createdAt: new Date(),
+            };
+            await paymentsCollection.insertOne(paymentDoc);
+          }
+
+          console.log(
+            `Stripe webhook: Successfully processed checkout.session.completed for session ${sessionId}`
+          );
+          return res.status(200).json({ received: true });
+        }
+
+        default:
+          console.log(
+            `Stripe webhook: Unhandled event type ${event.type}`
+          );
+          return res.status(200).json({ received: true, unhandled: true });
+      }
+    } catch (processError) {
+      console.error(
+        "Stripe webhook processing error:",
+        processError.message
+      );
+      return res.status(500).json({ error: "Failed to process webhook event" });
+    }
+  }
+);
+
+// Standard JSON parser for all subsequent endpoints
 app.use(express.json());
 
 // Better Auth JWT & JWKS Configuration
@@ -45,15 +306,28 @@ const client = new MongoClient(uri, {
   },
 });
 
-let database;
-let productsCollection;
-let reviewsCollection;
-let wishlistCollection;
-let paymentsCollection;
-let ordersCollection;
-let usersCollection;
+let customKeySet = null;
+const setVerificationKey = (key) => {
+  customKeySet = key;
+};
 
-// Auth Middleware: Verify Signature, Expiration, Issuer, and Audience
+// Validate user identity: ensures authenticated user has an active identity and required email
+const validateUserIdentity = (req, res) => {
+  if (
+    !req.user ||
+    !req.user.email ||
+    typeof req.user.email !== "string" ||
+    !req.user.email.trim()
+  ) {
+    res.status(401).json({
+      message: "Unauthorized: Valid user identity and email are required",
+    });
+    return false;
+  }
+  return true;
+};
+
+// Auth Middleware: Verify Signature, Expiration, Issuer, Audience, and Sync Database Record
 const verifyToken = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) {
@@ -71,16 +345,71 @@ const verifyToken = async (req, res, next) => {
 
   const token = parts[1];
   try {
-    const { payload } = await jwtVerify(token, JWKS, {
+    const key =
+      customKeySet ||
+      (process.env.JWT_SECRET
+        ? new TextEncoder().encode(process.env.JWT_SECRET)
+        : JWKS);
+
+    const { payload } = await jwtVerify(token, key, {
       issuer: JWT_ISSUER,
       audience: JWT_AUDIENCE,
     });
 
-    req.user = {
-      ...payload,
-      id: payload.sub,
-      role: payload.role || null, // Never assume 'buyer' if missing
-    };
+    // 1. Identity claim validation
+    if (
+      !payload.sub ||
+      !payload.email ||
+      typeof payload.email !== "string" ||
+      !payload.email.trim()
+    ) {
+      return res
+        .status(401)
+        .json({ message: "Unauthorized: Invalid or missing identity in token" });
+    }
+
+    const email = payload.email.trim();
+
+    // 2. Authoritative User Sync from MongoDB
+    if (usersCollection) {
+      let dbUser = await usersCollection.findOne({ email });
+      if (!dbUser && payload.sub) {
+        const idQuery = ObjectId.isValid(payload.sub)
+          ? { _id: new ObjectId(payload.sub) }
+          : { _id: payload.sub };
+        dbUser = await usersCollection.findOne(idQuery);
+      }
+
+      // Reject deleted or missing user record
+      if (!dbUser) {
+        return res
+          .status(401)
+          .json({ message: "Unauthorized: User record not found" });
+      }
+
+      // Reject blocked accounts on every authenticated route
+      if (dbUser.status === "blocked") {
+        return res
+          .status(403)
+          .json({ message: "Forbidden: Account is blocked" });
+      }
+
+      // Authoritative role from MongoDB - never trust JWT payload role alone
+      const authoritativeRole = dbUser.role || "buyer";
+
+      req.user = {
+        ...payload,
+        id: dbUser._id ? dbUser._id.toString() : payload.sub,
+        email: dbUser.email || email,
+        role: authoritativeRole,
+        status: dbUser.status || "active",
+        dbUser, // Cached to avoid duplicate database queries in requireRole
+      };
+    } else {
+      return res
+        .status(503)
+        .json({ message: "Service Unavailable: Database connection not ready" });
+    }
 
     next();
   } catch (error) {
@@ -93,11 +422,14 @@ const verifyToken = async (req, res, next) => {
 
 // Server-controlled role verification helper
 const getUserRole = async (user) => {
-  if (user.role) return user.role;
-  if (usersCollection && user.email) {
-    const dbUser = await usersCollection.findOne({ email: user.email });
+  if (!user || !user.email) return null;
+  if (usersCollection) {
+    const dbUser = await usersCollection.findOne({ email: user.email.trim() });
     if (dbUser && dbUser.role) {
       return dbUser.role;
+    }
+    if (dbUser) {
+      return "buyer";
     }
   }
   return null;
@@ -106,32 +438,47 @@ const getUserRole = async (user) => {
 // Role Enforcement Middleware: Validates permissions against server-controlled source
 const requireRole = (...allowedRoles) => {
   return async (req, res, next) => {
-    if (!req.user) {
+    if (!req.user || !req.user.email) {
       return res
         .status(401)
         .json({ message: "Unauthorized: User not authenticated" });
     }
 
-    let role = req.user.role;
-    if (!role) {
-      role = await getUserRole(req.user);
-      req.user.role = role;
+    // Reuse cached dbUser from verifyToken if available to avoid duplicate DB queries
+    let dbUser = req.user.dbUser;
+    if (!dbUser && usersCollection) {
+      const email = req.user.email.trim();
+      dbUser = await usersCollection.findOne({ email });
+      if (!dbUser && req.user.id) {
+        const idQuery = ObjectId.isValid(req.user.id)
+          ? { _id: new ObjectId(req.user.id) }
+          : { _id: req.user.id };
+        dbUser = await usersCollection.findOne(idQuery);
+      }
     }
 
-    if (!role || !allowedRoles.includes(role)) {
+    // Reject deleted or missing user record
+    if (!dbUser && usersCollection) {
+      return res
+        .status(401)
+        .json({ message: "Unauthorized: User record not found" });
+    }
+
+    // Reject blocked accounts
+    if (dbUser && dbUser.status === "blocked") {
+      return res
+        .status(403)
+        .json({ message: "Forbidden: Account is blocked" });
+    }
+
+    // Authoritative role from database
+    const authoritativeRole = (dbUser && dbUser.role) ? dbUser.role : (req.user.role || "buyer");
+    req.user.role = authoritativeRole;
+
+    if (!allowedRoles.includes(authoritativeRole)) {
       return res.status(403).json({
         message: `Forbidden: Requires one of [${allowedRoles.join(", ")}] permissions`,
       });
-    }
-
-    // Check if user is blocked in database
-    if (usersCollection && req.user.email) {
-      const dbUser = await usersCollection.findOne({ email: req.user.email });
-      if (dbUser && dbUser.status === "blocked") {
-        return res
-          .status(403)
-          .json({ message: "Forbidden: Account is blocked" });
-      }
     }
 
     next();
@@ -154,6 +501,15 @@ async function run() {
     ordersCollection = database.collection("orders");
     usersCollection = database.collection("user");
 
+    await client.db("admin").command({ ping: 1 });
+    console.log(
+      "Pinged your deployment. You successfully connected to MongoDB!"
+    );
+  } catch (error) {
+    console.error("MongoDB connection or setup error:", error);
+  }
+}
+
     // ──────────────────────────────────────────
     // PRODUCTS API
     // ──────────────────────────────────────────
@@ -165,7 +521,13 @@ async function run() {
       requireRole("seller", "admin"),
       async (req, res) => {
         try {
+          if (!validateUserIdentity(req, res)) return;
+
           const product = req.body;
+          if (!product || typeof product !== "object" || Array.isArray(product)) {
+            return res.status(400).send({ message: "Product data is required" });
+          }
+
           if (req.user.role !== "admin" || !product.sellerInfo) {
             product.sellerInfo = req.user.email;
           }
@@ -347,7 +709,13 @@ async function run() {
     // Post review (Authenticated)
     app.post("/api/reviews", verifyToken, async (req, res) => {
       try {
+        if (!validateUserIdentity(req, res)) return;
+
         const review = req.body;
+        if (!review || typeof review !== "object" || Array.isArray(review)) {
+          return res.status(400).send({ message: "Review data is required" });
+        }
+
         if (req.user.role !== "admin") {
           review.userEmail = req.user.email;
           if (review.review && typeof review.review === "object") {
@@ -426,9 +794,39 @@ async function run() {
       requireRole("buyer", "admin"),
       async (req, res) => {
         try {
+          if (!validateUserIdentity(req, res)) return;
+
           const orderData = req.body;
+          if (!orderData || typeof orderData !== "object" || Array.isArray(orderData)) {
+            return res.status(400).send({ message: "Order data is required" });
+          }
+
           if (req.user.role !== "admin" || !orderData.buyerInfo) {
             orderData.buyerInfo = req.user.email;
+          }
+
+          // Idempotency: avoid duplicate order if already created via webhook
+          if (orderData.paymentId && ordersCollection) {
+            const existingOrder = await ordersCollection.findOne({
+              paymentId: orderData.paymentId,
+            });
+            if (existingOrder) {
+              return res.status(200).send({
+                message: "Order already placed",
+                insertedId: existingOrder._id,
+              });
+            }
+          }
+
+          // Never trust client-supplied paymentStatus without verified payment record
+          if (req.user.role !== "admin" && orderData.paymentStatus === "paid") {
+            const verifiedPayment = orderData.paymentId && paymentsCollection
+              ? ((await paymentsCollection.findOne({ session_id: orderData.paymentId })) ||
+                 (await paymentsCollection.findOne({ transactionId: orderData.paymentId })))
+              : null;
+            if (!verifiedPayment) {
+              orderData.paymentStatus = "pending";
+            }
           }
 
           const result = await ordersCollection.insertOne({
@@ -644,10 +1042,12 @@ async function run() {
       requireRole("buyer", "admin"),
       async (req, res) => {
         try {
-          const { product } = req.body;
+          if (!validateUserIdentity(req, res)) return;
+
+          const { product } = req.body || {};
           const userInfo = req.user.email;
 
-          if (!product || !product._id) {
+          if (!product || typeof product !== "object" || !product._id) {
             return res.status(400).send({ message: "Product is required" });
           }
 
@@ -726,12 +1126,31 @@ async function run() {
       requireRole("buyer", "admin"),
       async (req, res) => {
         try {
+          if (!validateUserIdentity(req, res)) return;
+
           const payment = req.body;
+          if (!payment || typeof payment !== "object" || Array.isArray(payment)) {
+            return res.status(400).send({ message: "Payment data is required" });
+          }
+
           if (req.user.role !== "admin") {
             payment.metadata = {
               ...(payment.metadata || {}),
               userEmail: req.user.email,
             };
+          }
+
+          // Idempotency: avoid duplicate payment record if already created via webhook
+          if (payment.session_id && paymentsCollection) {
+            const existingPayment = await paymentsCollection.findOne({
+              session_id: payment.session_id,
+            });
+            if (existingPayment) {
+              return res.status(200).send({
+                message: "Payment already recorded",
+                insertedId: existingPayment._id,
+              });
+            }
           }
           payment.createdAt = new Date();
 
@@ -921,16 +1340,32 @@ async function run() {
       }
     );
 
-    await client.db("admin").command({ ping: 1 });
-    console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
-    );
-  } catch (error) {
-    console.error("MongoDB connection or setup error:", error);
-  }
+function setCollections(collections) {
+  if ("database" in collections) database = collections.database;
+  if ("productsCollection" in collections) productsCollection = collections.productsCollection;
+  if ("reviewsCollection" in collections) reviewsCollection = collections.reviewsCollection;
+  if ("wishlistCollection" in collections) wishlistCollection = collections.wishlistCollection;
+  if ("paymentsCollection" in collections) paymentsCollection = collections.paymentsCollection;
+  if ("ordersCollection" in collections) ordersCollection = collections.ordersCollection;
+  if ("usersCollection" in collections) usersCollection = collections.usersCollection;
 }
-run().catch(console.dir);
 
-app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`);
-});
+if (require.main === module) {
+  run().catch(console.dir);
+  app.listen(port, () => {
+    console.log(`Example app listening on port ${port}`);
+  });
+}
+
+module.exports = {
+  app,
+  verifyToken,
+  requireRole,
+  getUserRole,
+  validateUserIdentity,
+  setCollections,
+  setVerificationKey,
+  setStripeInstance,
+  run,
+  client,
+};
