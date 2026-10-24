@@ -8,7 +8,7 @@ const {
   requireRole,
   validateUserIdentity,
 } = require("../middleware/auth");
-const { extractEmail, escapeRegex } = require("../utils/helpers");
+const { extractEmail, escapeRegex, toStripeAmount } = require("../utils/helpers");
 
 const router = express.Router();
 
@@ -253,14 +253,31 @@ router.post(
         }
       }
 
-      // Concurrency & Reservation check: prevent competing checkout sessions
+      // Atomic conditional reservation in MongoDB BEFORE Stripe session creation.
+      // Guarantees that two concurrent buyers cannot both claim or overwrite a reservation for the same product.
       const now = new Date();
-      const isReservedByOther =
-        product.reservedUntil &&
-        new Date(product.reservedUntil) > now &&
-        product.reservedBy !== req.user.email;
+      const reservationExpiry = new Date(Date.now() + 30 * 60 * 1000);
 
-      if (isReservedByOther) {
+      const reserveFilter = {
+        ...productQuery,
+        status: { $nin: ["sold", "pending", "rejected"] },
+        $or: [
+          { status: "available" },
+          { reservedUntil: { $lte: now } },
+          { reservedBy: req.user.email },
+        ],
+      };
+
+      const reserveResult = await productsCollection.updateOne(reserveFilter, {
+        $set: {
+          status: "reserved",
+          reservedBy: req.user.email,
+          reservedUntil: reservationExpiry,
+          updatedAt: now,
+        },
+      });
+
+      if (!reserveResult || reserveResult.matchedCount === 0) {
         return res.status(409).json({
           message:
             "This product is currently reserved by another buyer in checkout. Please try again shortly.",
@@ -275,52 +292,73 @@ router.post(
         "http://localhost:3000";
 
       const currency = (config.CURRENCY || "usd").toLowerCase();
+      const unitAmount = toStripeAmount(authoritativePrice, currency);
 
-      const session = await stripe.checkout.sessions.create({
-        payment_method_types: ["card"],
-        line_items: [
-          {
-            price_data: {
-              currency,
-              product_data: {
-                name: product.title || "Marketplace Product",
-                images:
-                  Array.isArray(product.images) && product.images.length > 0
-                    ? [product.images[0]]
-                    : undefined,
+      let session;
+      try {
+        session = await stripe.checkout.sessions.create({
+          payment_method_types: ["card"],
+          line_items: [
+            {
+              price_data: {
+                currency,
+                product_data: {
+                  name: product.title || "Marketplace Product",
+                  images:
+                    Array.isArray(product.images) && product.images.length > 0
+                      ? [product.images[0]]
+                      : undefined,
+                },
+                unit_amount: unitAmount,
               },
-              unit_amount: Math.round(authoritativePrice * 100),
+              quantity: 1,
             },
-            quantity: 1,
+          ],
+          mode: "payment",
+          customer_email: req.user.email,
+          success_url: `${origin}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${origin}/products/${productId}`,
+          metadata: {
+            productId: String(product._id),
+            title: product.title || "Product",
+            price: String(authoritativePrice),
+            currency,
+            userEmail: req.user.email,
+            buyerName: req.user.name || "Buyer",
+            sellerInfo: sellerEmail || String(product.sellerInfo || "unknown"),
+            sellerName: product.sellerName || "Seller",
           },
-        ],
-        mode: "payment",
-        customer_email: req.user.email,
-        success_url: `${origin}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${origin}/products/${productId}`,
-        metadata: {
-          productId: String(product._id),
-          title: product.title || "Product",
-          price: String(authoritativePrice),
-          currency,
-          userEmail: req.user.email,
-          buyerName: req.user.name || "Buyer",
-          sellerInfo: sellerEmail || String(product.sellerInfo || "unknown"),
-          sellerName: product.sellerName || "Seller",
-        },
-      });
+        });
+      } catch (stripeErr) {
+        // Rollback provisional reservation if Stripe checkout session creation fails
+        await productsCollection.updateOne(
+          {
+            ...productQuery,
+            reservedBy: req.user.email,
+            status: "reserved",
+          },
+          {
+            $set: { status: "available", updatedAt: new Date() },
+            $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "" },
+          }
+        );
+        throw stripeErr;
+      }
 
-      // Atomically reserve the product for 30 minutes
-      const reservationExpiry = new Date(Date.now() + 30 * 60 * 1000);
-      await productsCollection.updateOne(productQuery, {
-        $set: {
-          status: "reserved",
+      // Record the Stripe checkout session ID on the active reservation
+      await productsCollection.updateOne(
+        {
+          ...productQuery,
           reservedBy: req.user.email,
-          reservedUntil: reservationExpiry,
-          reservationSessionId: session.id,
-          updatedAt: new Date(),
+          status: "reserved",
         },
-      });
+        {
+          $set: {
+            reservationSessionId: session.id,
+            updatedAt: new Date(),
+          },
+        }
+      );
 
       res.status(200).json({
         sessionId: session.id,

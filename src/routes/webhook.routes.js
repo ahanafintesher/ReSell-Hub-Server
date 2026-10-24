@@ -2,6 +2,7 @@ const express = require("express");
 const { ObjectId } = require("mongodb");
 const { getCollections } = require("../config/db");
 const { getStripeInstance } = require("../config/stripe");
+const { toStripeAmount, fromStripeAmount } = require("../utils/helpers");
 
 const router = express.Router();
 
@@ -134,23 +135,24 @@ router.post(
             product = await productsCollection.findOne(productQuery);
           }
 
-          // Authoritative price check
+          // Authoritative price and currency calculation
+          const sessionCurrency = (session.currency || "usd").toLowerCase();
           let authoritativePrice;
           if (product && product.price != null) {
             authoritativePrice = Number(product.price);
-            const expectedAmountCents = Math.round(authoritativePrice * 100);
+            const expectedAmountSubunits = toStripeAmount(authoritativePrice, sessionCurrency);
 
             // Security check: Validate against client-manipulated amount in session
             if (
               session.amount_total != null &&
-              session.amount_total < expectedAmountCents
+              session.amount_total < expectedAmountSubunits
             ) {
               console.error(
                 "Stripe webhook security error: Price mismatch detected",
                 {
                   sessionId: currentSessionId,
-                  paidCents: session.amount_total,
-                  expectedCents: expectedAmountCents,
+                  paidSubunits: session.amount_total,
+                  expectedSubunits: expectedAmountSubunits,
                   productId,
                 }
               );
@@ -162,7 +164,7 @@ router.post(
           } else if (metadata.price != null && !isNaN(Number(metadata.price))) {
             authoritativePrice = Number(metadata.price);
           } else if (session.amount_total != null) {
-            authoritativePrice = session.amount_total / 100;
+            authoritativePrice = fromStripeAmount(session.amount_total, sessionCurrency);
           } else {
             authoritativePrice = 0;
           }
@@ -214,6 +216,42 @@ router.post(
             }
           }
 
+          // Duplicate Payment Reconciliation & Automatic Refund Processing:
+          // Attempt an immediate Stripe refund. If confirmed by Stripe, status is 'refunded'.
+          // Otherwise, it is safely queued with status 'pending_refund' in a durable queue.
+          let refundResult = null;
+          let refundStatus = isDoubleSale ? "pending_refund" : undefined;
+          let refundError = null;
+
+          if (isDoubleSale && paymentIntentId) {
+            try {
+              const stripe = getStripeInstance();
+              if (
+                stripe &&
+                stripe.refunds &&
+                typeof stripe.refunds.create === "function"
+              ) {
+                const refund = await stripe.refunds.create({
+                  payment_intent: paymentIntentId,
+                  reason: "duplicate",
+                });
+                if (refund && refund.status === "succeeded") {
+                  refundResult = refund;
+                  refundStatus = "refunded";
+                } else if (refund && refund.status === "pending") {
+                  refundResult = refund;
+                  refundStatus = "pending_refund";
+                }
+              }
+            } catch (rErr) {
+              refundError = rErr.message || String(rErr);
+              console.error(
+                "Stripe automatic refund attempt error for duplicate purchase:",
+                refundError
+              );
+            }
+          }
+
           // 3. Insert or update order
           let orderId = null;
           if (existingOrder) {
@@ -231,7 +269,7 @@ router.post(
               productId: productId || (product ? product._id.toString() : null),
               productTitle,
               price: authoritativePrice,
-              currency: session.currency || "usd",
+              currency: sessionCurrency,
               sellerName,
               sellerInfo,
               buyerName,
@@ -241,10 +279,22 @@ router.post(
               rejectionReason: isDoubleSale
                 ? "Product already sold to another customer. Automatic refund required."
                 : undefined,
+              refundStatus: isDoubleSale ? refundStatus : undefined,
+              refundId: refundResult ? refundResult.id : undefined,
               createdAt: new Date(),
             };
-            const orderResult = await ordersCollection.insertOne(orderDoc);
-            orderId = orderResult.insertedId;
+            try {
+              const orderResult = await ordersCollection.insertOne(orderDoc);
+              orderId = orderResult.insertedId;
+            } catch (insertErr) {
+              if (insertErr.code === 11000) {
+                console.log(
+                  `Stripe webhook: Order for session ${currentSessionId} already exists (concurrent insert caught)`
+                );
+                return res.status(200).json({ received: true, message: "Already processed" });
+              }
+              throw insertErr;
+            }
           }
 
           // 4. Insert payment record if not existing
@@ -255,11 +305,15 @@ router.post(
               orderId,
               amount:
                 session.amount_total != null
-                  ? session.amount_total / 100
+                  ? fromStripeAmount(session.amount_total, sessionCurrency)
                   : authoritativePrice,
-              currency: session.currency || "usd",
+              currency: sessionCurrency,
               paymentStatus: "paid",
               fulfillmentStatus: isDoubleSale ? "failed_duplicate_purchase" : "fulfilled",
+              refundStatus: isDoubleSale ? refundStatus : undefined,
+              refundId: refundResult ? refundResult.id : undefined,
+              refundError: refundError || undefined,
+              refundQueue: isDoubleSale && refundStatus !== "refunded",
               metadata: {
                 ...metadata,
                 userEmail: buyerEmail,
@@ -269,7 +323,17 @@ router.post(
               date: new Date().toISOString(),
               createdAt: new Date(),
             };
-            await paymentsCollection.insertOne(paymentDoc);
+            try {
+              await paymentsCollection.insertOne(paymentDoc);
+            } catch (insertErr) {
+              if (insertErr.code === 11000) {
+                console.log(
+                  `Stripe webhook: Payment for session ${currentSessionId} already exists (concurrent insert caught)`
+                );
+                return res.status(200).json({ received: true, message: "Already processed" });
+              }
+              throw insertErr;
+            }
           }
 
           // 5. Update product status to sold in database (only if not already sold to another buyer)
@@ -301,10 +365,13 @@ router.post(
             const productQuery = ObjectId.isValid(productId)
               ? { _id: new ObjectId(productId) }
               : { _id: productId };
+            // Strictly release ONLY active reservations belonging to this exact session ID
+            // and ensure a sold or transferred product is never released
             await productsCollection.updateOne(
               {
                 ...productQuery,
                 reservationSessionId: session.id,
+                status: "reserved",
               },
               {
                 $set: { status: "available", updatedAt: new Date() },

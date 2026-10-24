@@ -24,6 +24,7 @@ const collections = {
   ordersCollection: null,
   usersCollection: null,
   reportsCollection: null,
+  processedEventsCollection: null,
 };
 
 function getCollections() {
@@ -47,6 +48,8 @@ function setCollections(newCollections) {
     collections.usersCollection = newCollections.usersCollection;
   if ("reportsCollection" in newCollections)
     collections.reportsCollection = newCollections.reportsCollection;
+  if ("processedEventsCollection" in newCollections)
+    collections.processedEventsCollection = newCollections.processedEventsCollection;
 }
 
 /**
@@ -65,11 +68,11 @@ async function createIndexes() {
     if (collections.ordersCollection && typeof collections.ordersCollection.createIndex === "function") {
       await collections.ordersCollection.createIndex({ buyerInfo: 1 });
       await collections.ordersCollection.createIndex({ sellerInfo: 1 });
-      await collections.ordersCollection.createIndex({ paymentId: 1 });
+      await collections.ordersCollection.createIndex({ paymentId: 1 }, { unique: true, sparse: true });
       await collections.ordersCollection.createIndex({ orderStatus: 1 });
     }
     if (collections.paymentsCollection && typeof collections.paymentsCollection.createIndex === "function") {
-      await collections.paymentsCollection.createIndex({ session_id: 1 });
+      await collections.paymentsCollection.createIndex({ session_id: 1 }, { unique: true, sparse: true });
       await collections.paymentsCollection.createIndex({ transactionId: 1 });
       await collections.paymentsCollection.createIndex({ "metadata.userEmail": 1 });
     }
@@ -84,6 +87,9 @@ async function createIndexes() {
       await collections.reportsCollection.createIndex({ productId: 1 });
       await collections.reportsCollection.createIndex({ reporterEmail: 1 });
       await collections.reportsCollection.createIndex({ status: 1 });
+    }
+    if (collections.processedEventsCollection && typeof collections.processedEventsCollection.createIndex === "function") {
+      await collections.processedEventsCollection.createIndex({ eventId: 1 }, { unique: true });
     }
   } catch (indexErr) {
     // Indexes are safe optimizations; don't crash if database has restricted index privileges
@@ -107,6 +113,7 @@ async function run() {
     collections.ordersCollection = collections.database.collection("orders");
     collections.usersCollection = collections.database.collection("user");
     collections.reportsCollection = collections.database.collection("reports");
+    collections.processedEventsCollection = collections.database.collection("processed_events");
 
     await client.db("admin").command({ ping: 1 });
     console.log(

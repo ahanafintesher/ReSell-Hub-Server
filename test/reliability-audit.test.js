@@ -40,6 +40,53 @@ async function createTestToken(payload, options = {}) {
 function createEnhancedMockCollection(initialData = []) {
   let docs = [...initialData];
 
+  function matchesFilter(d, filter) {
+    for (const key of Object.keys(filter)) {
+      if (key === "$or" && Array.isArray(filter.$or)) {
+        const anyMatch = filter.$or.some((subFilter) =>
+          matchesFilter(d, subFilter)
+        );
+        if (!anyMatch) return false;
+        continue;
+      }
+
+      if (key === "$and" && Array.isArray(filter.$and)) {
+        const allMatch = filter.$and.every((subFilter) =>
+          matchesFilter(d, subFilter)
+        );
+        if (!allMatch) return false;
+        continue;
+      }
+
+      const val = key.includes(".")
+        ? key.split(".").reduce((acc, part) => acc?.[part], d)
+        : d[key];
+
+      const expected = filter[key];
+
+      if (key === "_id") {
+        const filterId =
+          expected instanceof ObjectId ? expected.toString() : String(expected);
+        const docId =
+          val instanceof ObjectId ? val.toString() : String(val);
+        if (docId !== filterId) return false;
+      } else if (expected && typeof expected === "object") {
+        if ("$ne" in expected && val === expected.$ne) return false;
+        if ("$nin" in expected && Array.isArray(expected.$nin) && expected.$nin.includes(val)) return false;
+        if ("$in" in expected && Array.isArray(expected.$in) && !expected.$in.includes(val)) return false;
+        if ("$regex" in expected) {
+          const re = new RegExp(expected.$regex, expected.$options || "");
+          if (!re.test(String(val || ""))) return false;
+        }
+        if ("$gte" in expected && (val == null || Number(val) < Number(expected.$gte))) return false;
+        if ("$lte" in expected && (val == null || Number(val) > Number(expected.$lte))) return false;
+      } else {
+        if (val !== expected) return false;
+      }
+    }
+    return true;
+  }
+
   return {
     _docs: docs,
     reset(data = []) {
@@ -51,84 +98,10 @@ function createEnhancedMockCollection(initialData = []) {
       return match.length;
     },
     async findOne(filter = {}) {
-      return (
-        docs.find((d) => {
-          for (const key of Object.keys(filter)) {
-            if (key === "_id") {
-              const filterId =
-                filter._id instanceof ObjectId
-                  ? filter._id.toString()
-                  : String(filter._id);
-              const docId =
-                d._id instanceof ObjectId ? d._id.toString() : String(d._id);
-              if (docId !== filterId) return false;
-            } else if (key.includes(".")) {
-              const parts = key.split(".");
-              let val = d;
-              for (const p of parts) val = val?.[p];
-              if (val !== filter[key]) return false;
-            } else {
-              if (d[key] !== filter[key]) return false;
-            }
-          }
-          return true;
-        }) || null
-      );
+      return docs.find((d) => matchesFilter(d, filter)) || null;
     },
     find(filter = {}) {
-      let matched = docs.filter((d) => {
-        for (const key of Object.keys(filter)) {
-          if (key === "_id") {
-            const filterId =
-              filter._id instanceof ObjectId
-                ? filter._id.toString()
-                : String(filter._id);
-            const docId =
-              d._id instanceof ObjectId ? d._id.toString() : String(d._id);
-            if (docId !== filterId) return false;
-          } else if (
-            filter[key] &&
-            typeof filter[key] === "object" &&
-            "$regex" in filter[key]
-          ) {
-            const re = new RegExp(
-              filter[key].$regex,
-              filter[key].$options || ""
-            );
-            if (!re.test(d[key] || "")) return false;
-          } else if (
-            filter[key] &&
-            typeof filter[key] === "object"
-          ) {
-            const expected = filter[key];
-            if ("$ne" in expected && d[key] === expected.$ne) return false;
-            if (
-              "$nin" in expected &&
-              Array.isArray(expected.$nin) &&
-              expected.$nin.includes(d[key])
-            ) {
-              return false;
-            }
-            if (
-              "$in" in expected &&
-              Array.isArray(expected.$in) &&
-              !expected.$in.includes(d[key])
-            ) {
-              return false;
-            }
-            if ("$gte" in expected && Number(d[key]) < expected.$gte) return false;
-            if ("$lte" in expected && Number(d[key]) > expected.$lte) return false;
-          } else if (key.includes(".")) {
-            const parts = key.split(".");
-            let val = d;
-            for (const p of parts) val = val?.[p];
-            if (val !== filter[key]) return false;
-          } else {
-            if (d[key] !== filter[key]) return false;
-          }
-        }
-        return true;
-      });
+      let matched = docs.filter((d) => matchesFilter(d, filter));
 
       const chain = {
         toArray: async () => matched,
@@ -136,9 +109,13 @@ function createEnhancedMockCollection(initialData = []) {
           const entries = Object.entries(sortObj);
           if (entries.length > 0) {
             const [field, dir] = entries[0];
-            matched = [...matched].sort((a, b) =>
-              dir === 1 ? a[field] - b[field] : b[field] - a[field]
-            );
+            matched = [...matched].sort((a, b) => {
+              const valA = a[field];
+              const valB = b[field];
+              if (valA < valB) return dir === 1 ? -1 : 1;
+              if (valA > valB) return dir === 1 ? 1 : -1;
+              return 0;
+            });
           }
           return chain;
         },
@@ -168,23 +145,15 @@ function createEnhancedMockCollection(initialData = []) {
       if (update.$set) {
         Object.assign(doc, update.$set);
       }
+      if (update.$unset) {
+        for (const k of Object.keys(update.$unset)) {
+          delete doc[k];
+        }
+      }
       return { acknowledged: true, matchedCount: 1, modifiedCount: 1 };
     },
     async deleteOne(filter) {
-      const idx = docs.findIndex((d) => {
-        for (const key of Object.keys(filter)) {
-          if (key === "_id") {
-            const filterId =
-              filter._id instanceof ObjectId
-                ? filter._id.toString()
-                : String(filter._id);
-            const docId =
-              d._id instanceof ObjectId ? d._id.toString() : String(d._id);
-            if (docId !== filterId) return false;
-          } else if (d[key] !== filter[key]) return false;
-        }
-        return true;
-      });
+      const idx = docs.findIndex((d) => matchesFilter(d, filter));
       if (idx === -1) return { acknowledged: true, deletedCount: 0 };
       docs.splice(idx, 1);
       return { acknowledged: true, deletedCount: 1 };

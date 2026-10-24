@@ -341,9 +341,36 @@ router.delete(
         });
       }
 
+      const { productsCollection } = getCollections();
       const result = await ordersCollection.deleteOne({
         _id: new ObjectId(orderId),
       });
+
+      // Restore product availability if no other active paid order holds the product
+      if (order.productId && productsCollection) {
+        const otherActiveOrder = await ordersCollection.findOne({
+          productId: String(order.productId),
+          _id: { $ne: new ObjectId(orderId) },
+          paymentStatus: "paid",
+          orderStatus: { $nin: ["cancelled", "rejected"] },
+        });
+
+        if (!otherActiveOrder) {
+          const prodQuery = ObjectId.isValid(order.productId)
+            ? { _id: new ObjectId(order.productId) }
+            : { _id: order.productId };
+          await productsCollection.updateOne(prodQuery, {
+            $set: { status: "available", updatedAt: new Date() },
+            $unset: {
+              soldTo: "",
+              soldPaymentId: "",
+              reservedBy: "",
+              reservedUntil: "",
+              reservationSessionId: "",
+            },
+          });
+        }
+      }
 
       res.send({
         success: true,

@@ -188,6 +188,13 @@ describe("Adversarial Production Readiness Regression Suite", () => {
         }),
       },
     },
+    refunds: {
+      create: async (params) => ({
+        id: `re_test_${Date.now()}`,
+        status: "succeeded",
+        ...params,
+      }),
+    },
     webhooks: {
       constructEvent: (body, sig, secret) => {
         return JSON.parse(body.toString());
@@ -386,6 +393,49 @@ describe("Adversarial Production Readiness Regression Suite", () => {
       assert.strictEqual(res2.status, 409);
       const data2 = await res2.json();
       assert.match(data2.message, /reserved by another buyer/i);
+    });
+
+    it("concurrent checkout attempts: exactly one buyer wins reservation and one gets 409", async () => {
+      // Reset product to available
+      await mockProducts.updateOne(
+        { _id: new ObjectId("60c72b2f9b1d8b2bad100001") },
+        {
+          $set: { status: "available" },
+          $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "" },
+        }
+      );
+
+      // Concurrently fire checkout session creation
+      const [res1, res2] = await Promise.all([
+        fetch(`${baseUrl}/api/create-checkout-session`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${buyer1Token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ productId: "60c72b2f9b1d8b2bad100001" }),
+        }),
+        fetch(`${baseUrl}/api/create-checkout-session`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${buyer2Token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ productId: "60c72b2f9b1d8b2bad100001" }),
+        }),
+      ]);
+
+      const statuses = [res1.status, res2.status].sort();
+      assert.deepStrictEqual(statuses, [200, 409]);
+
+      const prod = await mockProducts.findOne({
+        _id: new ObjectId("60c72b2f9b1d8b2bad100001"),
+      });
+      assert.strictEqual(prod.status, "reserved");
+      assert.ok(
+        prod.reservedBy === "buyer1@example.com" ||
+        prod.reservedBy === "buyer2@example.com"
+      );
     });
 
     it("Buyer 1 can refresh or re-create checkout session on their own reserved product", async () => {
@@ -652,6 +702,38 @@ describe("Adversarial Production Readiness Regression Suite", () => {
       });
       assert.strictEqual(prod.status, "available");
     });
+
+    it("DELETE /api/orders/:orderId hard cancellation restores product availability", async () => {
+      await mockProducts.updateOne(
+        { _id: new ObjectId("60c72b2f9b1d8b2bad100001") },
+        { $set: { status: "sold", soldTo: "buyer1@example.com" } }
+      );
+
+      await mockOrders.insertOne({
+        _id: new ObjectId("60c72b2f9b1d8b2bad300005"),
+        productId: "60c72b2f9b1d8b2bad100001",
+        sellerInfo: "seller@example.com",
+        buyerInfo: "buyer1@example.com",
+        paymentStatus: "paid",
+        orderStatus: "pending",
+      });
+
+      const res = await fetch(
+        `${baseUrl}/api/orders/60c72b2f9b1d8b2bad300005`,
+        {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${buyer1Token}` },
+        }
+      );
+      assert.strictEqual(res.status, 200);
+
+      // Product is restored to available
+      const prod = await mockProducts.findOne({
+        _id: new ObjectId("60c72b2f9b1d8b2bad100001"),
+      });
+      assert.strictEqual(prod.status, "available");
+      assert.strictEqual(prod.soldTo, undefined);
+    });
   });
 
   // ──────────────────────────────────────────
@@ -734,6 +816,8 @@ describe("Adversarial Production Readiness Regression Suite", () => {
       });
       assert.ok(payment2);
       assert.strictEqual(payment2.fulfillmentStatus, "failed_duplicate_purchase");
+      assert.strictEqual(payment2.refundStatus, "pending_refund");
+      assert.strictEqual(payment2.refundQueue, true);
 
       // Verify second order was created with status 'rejected' rather than 'pending'
       const order2 = await mockOrders.findOne({
@@ -741,12 +825,76 @@ describe("Adversarial Production Readiness Regression Suite", () => {
       });
       assert.ok(order2);
       assert.strictEqual(order2.orderStatus, "rejected");
+      assert.strictEqual(order2.refundStatus, "pending_refund");
 
       // Product ownership was NOT overwritten
       const finalProd = await mockProducts.findOne({
         _id: new ObjectId("60c72b2f9b1d8b2bad100001"),
       });
       assert.strictEqual(finalProd.soldTo, "buyer1@example.com");
+    });
+
+    it("competing session with payment_intent triggers automatic Stripe refund and records refundStatus: refunded", async () => {
+      // Prior active paid order exists for this product
+      await mockOrders.insertOne({
+        productId: "60c72b2f9b1d8b2bad100001",
+        paymentId: "cs_session_first_buyer",
+        transactionId: "pi_first_buyer",
+        paymentStatus: "paid",
+        orderStatus: "pending",
+      });
+      await mockProducts.updateOne(
+        { _id: new ObjectId("60c72b2f9b1d8b2bad100001") },
+        { $set: { status: "sold", soldTo: "buyer1@example.com" } }
+      );
+
+      // Competing session that includes payment_intent arrives
+      const session3Payload = {
+        type: "checkout.session.completed",
+        data: {
+          object: {
+            id: "cs_session_third_buyer",
+            payment_status: "paid",
+            payment_intent: "pi_third_buyer_auto_refund",
+            amount_total: 25000,
+            currency: "usd",
+            customer_email: "buyer3@example.com",
+            metadata: {
+              productId: "60c72b2f9b1d8b2bad100001",
+              price: "250",
+              userEmail: "buyer3@example.com",
+            },
+          },
+        },
+      };
+
+      const res3 = await fetch(`${baseUrl}/api/stripe/webhook`, {
+        method: "POST",
+        headers: {
+          "stripe-signature": "valid_mock_sig",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(session3Payload),
+      });
+      assert.strictEqual(res3.status, 200);
+      const data3 = await res3.json();
+      assert.strictEqual(data3.doubleSale, true);
+
+      const payment3 = await mockPayments.findOne({
+        session_id: "cs_session_third_buyer",
+      });
+      assert.ok(payment3);
+      assert.strictEqual(payment3.fulfillmentStatus, "failed_duplicate_purchase");
+      assert.strictEqual(payment3.refundStatus, "refunded");
+      assert.ok(payment3.refundId);
+
+      const order3 = await mockOrders.findOne({
+        paymentId: "cs_session_third_buyer",
+      });
+      assert.ok(order3);
+      assert.strictEqual(order3.orderStatus, "rejected");
+      assert.strictEqual(order3.refundStatus, "refunded");
+      assert.ok(order3.refundId);
     });
 
     it("releases reservation when checkout.session.expired arrives", async () => {
@@ -787,6 +935,92 @@ describe("Adversarial Production Readiness Regression Suite", () => {
       });
       assert.strictEqual(prod.status, "available");
       assert.strictEqual(prod.reservationSessionId, undefined);
+    });
+
+    it("delayed checkout.session.expired does not reset an already sold product to available", async () => {
+      // Set product as sold
+      await mockProducts.updateOne(
+        { _id: new ObjectId("60c72b2f9b1d8b2bad100001") },
+        {
+          $set: {
+            status: "sold",
+            soldTo: "buyer1@example.com",
+            soldPaymentId: "cs_session_first_buyer",
+          },
+          $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "" },
+        }
+      );
+
+      const delayedExpirePayload = {
+        type: "checkout.session.expired",
+        data: {
+          object: {
+            id: "cs_old_expired_session",
+            metadata: { productId: "60c72b2f9b1d8b2bad100001" },
+          },
+        },
+      };
+
+      const res = await fetch(`${baseUrl}/api/stripe/webhook`, {
+        method: "POST",
+        headers: {
+          "stripe-signature": "valid_mock_sig",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(delayedExpirePayload),
+      });
+      assert.strictEqual(res.status, 200);
+
+      // Product MUST still be sold
+      const prod = await mockProducts.findOne({
+        _id: new ObjectId("60c72b2f9b1d8b2bad100001"),
+      });
+      assert.strictEqual(prod.status, "sold");
+      assert.strictEqual(prod.soldTo, "buyer1@example.com");
+    });
+
+    it("delayed checkout.session.expired does not release a newer active reservation", async () => {
+      // Product currently reserved under a newer session cs_newer_session
+      await mockProducts.updateOne(
+        { _id: new ObjectId("60c72b2f9b1d8b2bad100001") },
+        {
+          $set: {
+            status: "reserved",
+            reservationSessionId: "cs_newer_session",
+            reservedBy: "buyer1@example.com",
+            reservedUntil: new Date(Date.now() + 15 * 60 * 1000),
+          },
+        }
+      );
+
+      // Delayed webhook arrives for old session
+      const delayedExpirePayload = {
+        type: "checkout.session.expired",
+        data: {
+          object: {
+            id: "cs_older_expired_session",
+            metadata: { productId: "60c72b2f9b1d8b2bad100001" },
+          },
+        },
+      };
+
+      const res = await fetch(`${baseUrl}/api/stripe/webhook`, {
+        method: "POST",
+        headers: {
+          "stripe-signature": "valid_mock_sig",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(delayedExpirePayload),
+      });
+      assert.strictEqual(res.status, 200);
+
+      // Product MUST still be reserved under cs_newer_session
+      const prod = await mockProducts.findOne({
+        _id: new ObjectId("60c72b2f9b1d8b2bad100001"),
+      });
+      assert.strictEqual(prod.status, "reserved");
+      assert.strictEqual(prod.reservationSessionId, "cs_newer_session");
+      assert.strictEqual(prod.reservedBy, "buyer1@example.com");
     });
   });
 
