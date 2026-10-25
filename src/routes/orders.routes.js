@@ -1,12 +1,14 @@
 const express = require("express");
 const { ObjectId } = require("mongodb");
 const { getCollections } = require("../config/db");
+const { getStripeInstance } = require("../config/stripe");
 const {
   verifyToken,
   requireRole,
   validateUserIdentity,
 } = require("../middleware/auth");
 const { extractEmail } = require("../utils/helpers");
+const { getRefundIdempotencyKey } = require("../utils/refundRecovery");
 
 const router = express.Router();
 
@@ -118,12 +120,33 @@ router.post(
           ? orderData.orderStatus
           : "pending";
 
-      const result = await ordersCollection.insertOne({
-        ...orderData,
-        orderStatus: initialOrderStatus,
-        createdAt: new Date(),
-      });
-      res.status(201).send(result);
+      try {
+        const result = await ordersCollection.insertOne({
+          ...orderData,
+          orderStatus: initialOrderStatus,
+          createdAt: new Date(),
+        });
+        res.status(201).send(result);
+      } catch (insertErr) {
+        if (insertErr.code === 11000) {
+          if (orderData.paymentId) {
+            const existingOrder = await ordersCollection.findOne({
+              paymentId: orderData.paymentId,
+            });
+            if (existingOrder) {
+              return res.status(200).send({
+                message: "Order already placed",
+                insertedId: existingOrder._id,
+                order: existingOrder,
+              });
+            }
+          }
+          return res.status(409).send({
+            message: "Duplicate key violation: an order with this identifier already exists",
+          });
+        }
+        throw insertErr;
+      }
     } catch (error) {
       console.error("Post order error:", error.message || error);
       res.status(500).send({ message: "Failed to place order" });
@@ -367,6 +390,7 @@ router.delete(
               reservedBy: "",
               reservedUntil: "",
               reservationSessionId: "",
+              reservationSessionUrl: "",
             },
           });
         }
@@ -502,6 +526,7 @@ router.patch(
             cancelledBy: req.user.email,
             refundStatus:
               order.paymentStatus === "paid" ? "pending_refund" : "not_applicable",
+            refundQueue: order.paymentStatus === "paid",
             updatedAt: new Date(),
           },
         }
@@ -512,6 +537,90 @@ router.patch(
           message:
             "Order cannot be cancelled. It may have already been shipped, delivered, or cancelled.",
         });
+      }
+
+      // If order was already paid, attempt immediate deterministic refund via Stripe
+      if (order.paymentStatus === "paid") {
+        const { paymentsCollection } = getCollections();
+        let paymentIntentId =
+          order.transactionId && order.transactionId.startsWith("pi_")
+            ? order.transactionId
+            : null;
+
+        if (!paymentIntentId && paymentsCollection && order.paymentId) {
+          const paymentDoc = await paymentsCollection.findOne({
+            $or: [
+              { session_id: order.paymentId },
+              { transactionId: order.paymentId },
+            ],
+          });
+          if (
+            paymentDoc &&
+            paymentDoc.transactionId &&
+            paymentDoc.transactionId.startsWith("pi_")
+          ) {
+            paymentIntentId = paymentDoc.transactionId;
+          }
+        }
+
+        if (paymentIntentId) {
+          const stripe = getStripeInstance();
+          const idempotencyKey = getRefundIdempotencyKey(
+            order._id,
+            "order_cancel"
+          );
+          try {
+            if (
+              stripe &&
+              stripe.refunds &&
+              typeof stripe.refunds.create === "function"
+            ) {
+              const refund = await stripe.refunds.create(
+                {
+                  payment_intent: paymentIntentId,
+                  reason: "requested_by_customer",
+                },
+                { idempotencyKey }
+              );
+
+              if (
+                refund &&
+                (refund.status === "succeeded" || refund.status === "pending")
+              ) {
+                const finalStatus =
+                  refund.status === "succeeded" ? "refunded" : "pending_refund";
+                await ordersCollection.updateOne(
+                  { _id: new ObjectId(orderId) },
+                  {
+                    $set: {
+                      refundStatus: finalStatus,
+                      refundId: refund.id,
+                      refundQueue: finalStatus !== "refunded",
+                      refundSuccessAt: new Date(),
+                      updatedAt: new Date(),
+                    },
+                    $unset: { refundError: "" },
+                  }
+                );
+              }
+            }
+          } catch (rErr) {
+            console.error(
+              "Immediate Stripe refund error on cancellation:",
+              rErr.message || rErr
+            );
+            await ordersCollection.updateOne(
+              { _id: new ObjectId(orderId) },
+              {
+                $set: {
+                  refundError: rErr.message || String(rErr),
+                  refundQueue: true,
+                  updatedAt: new Date(),
+                },
+              }
+            );
+          }
+        }
       }
 
       // Restore product availability only if no other active paid order holds the product
@@ -535,6 +644,7 @@ router.patch(
               reservedBy: "",
               reservedUntil: "",
               reservationSessionId: "",
+              reservationSessionUrl: "",
             },
           });
         }

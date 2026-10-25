@@ -253,9 +253,50 @@ router.post(
         }
       }
 
-      // Atomic conditional reservation in MongoDB BEFORE Stripe session creation.
-      // Guarantees that two concurrent buyers cannot both claim or overwrite a reservation for the same product.
+      // Check if current buyer already has an active, valid reservation with an open Stripe session
       const now = new Date();
+      const isSameBuyerActiveReservation =
+        product.status === "reserved" &&
+        product.reservedBy === req.user.email &&
+        product.reservedUntil &&
+        new Date(product.reservedUntil) > now;
+
+      if (isSameBuyerActiveReservation) {
+        if (product.reservationSessionId) {
+          const stripe = getStripeInstance();
+          let isOpen = true;
+          if (
+            stripe &&
+            stripe.checkout &&
+            stripe.checkout.sessions &&
+            typeof stripe.checkout.sessions.retrieve === "function"
+          ) {
+            try {
+              const existingSession = await stripe.checkout.sessions.retrieve(
+                product.reservationSessionId
+              );
+              isOpen = existingSession && existingSession.status === "open";
+            } catch (sessionErr) {
+              isOpen = false;
+            }
+          }
+
+          if (isOpen) {
+            return res.status(200).json({
+              sessionId: product.reservationSessionId,
+              url: product.reservationSessionUrl || "https://checkout.stripe.com/pay/session",
+              resumed: true,
+            });
+          }
+        }
+        return res.status(409).json({
+          message:
+            "A checkout session is already in progress for this product. Please complete or cancel it before trying again.",
+        });
+      }
+
+      // Atomic conditional reservation in MongoDB BEFORE Stripe session creation.
+      // Guarantees that two concurrent requests (same or different buyers) cannot both claim or overwrite a reservation.
       const reservationExpiry = new Date(Date.now() + 30 * 60 * 1000);
 
       const reserveFilter = {
@@ -264,7 +305,6 @@ router.post(
         $or: [
           { status: "available" },
           { reservedUntil: { $lte: now } },
-          { reservedBy: req.user.email },
         ],
       };
 
@@ -273,11 +313,52 @@ router.post(
           status: "reserved",
           reservedBy: req.user.email,
           reservedUntil: reservationExpiry,
+          reservationSessionId: null,
+          reservationSessionUrl: null,
           updatedAt: now,
         },
       });
 
       if (!reserveResult || reserveResult.matchedCount === 0) {
+        // Check if competing request was from the same buyer
+        const currentProd = await productsCollection.findOne(productQuery);
+        if (
+          currentProd &&
+          currentProd.status === "reserved" &&
+          currentProd.reservedBy === req.user.email
+        ) {
+          if (currentProd.reservationSessionId) {
+            const stripe = getStripeInstance();
+            let isOpen = true;
+            if (
+              stripe &&
+              stripe.checkout &&
+              stripe.checkout.sessions &&
+              typeof stripe.checkout.sessions.retrieve === "function"
+            ) {
+              try {
+                const existingSession = await stripe.checkout.sessions.retrieve(
+                  currentProd.reservationSessionId
+                );
+                isOpen = existingSession && existingSession.status === "open";
+              } catch (e) {
+                isOpen = false;
+              }
+            }
+            if (isOpen) {
+              return res.status(200).json({
+                sessionId: currentProd.reservationSessionId,
+                url: currentProd.reservationSessionUrl || "https://checkout.stripe.com/pay/session",
+                resumed: true,
+              });
+            }
+          }
+          return res.status(409).json({
+            message:
+              "A checkout session is already in progress for this product. Please complete or cancel it before trying again.",
+          });
+        }
+
         return res.status(409).json({
           message:
             "This product is currently reserved by another buyer in checkout. Please try again shortly.",
@@ -339,13 +420,13 @@ router.post(
           },
           {
             $set: { status: "available", updatedAt: new Date() },
-            $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "" },
+            $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "", reservationSessionUrl: "" },
           }
         );
         throw stripeErr;
       }
 
-      // Record the Stripe checkout session ID on the active reservation
+      // Record the Stripe checkout session ID and URL on the active reservation
       await productsCollection.updateOne(
         {
           ...productQuery,
@@ -355,6 +436,7 @@ router.post(
         {
           $set: {
             reservationSessionId: session.id,
+            reservationSessionUrl: session.url,
             updatedAt: new Date(),
           },
         }

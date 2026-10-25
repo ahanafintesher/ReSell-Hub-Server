@@ -1,0 +1,340 @@
+const { getCollections } = require("../config/db");
+const { getStripeInstance } = require("../config/stripe");
+
+let recoveryTimer = null;
+
+/**
+ * Derives a stable, deterministic idempotency key for refunds.
+ */
+function getRefundIdempotencyKey(identifier, type = "duplicate") {
+  return `refund_${type}_${String(identifier).trim()}`;
+}
+
+/**
+ * Processes pending refunds from orders and payments collections.
+ * Uses atomic claim locks and deterministic Stripe idempotency keys.
+ */
+async function processPendingRefunds(options = {}) {
+  const maxBatch = options.maxBatch || 10;
+  const maxRetries = options.maxRetries || 3;
+  const now = new Date();
+  const lockTimeoutMs = 5 * 60 * 1000; // 5 minute claim lock
+  const staleClaimThreshold = new Date(now.getTime() - lockTimeoutMs);
+
+  const { ordersCollection, paymentsCollection } = getCollections();
+  const stripe = getStripeInstance();
+
+  if (!stripe || (!ordersCollection && !paymentsCollection)) {
+    return { processed: 0, refunded: 0, failed: 0, message: "Dependencies not ready" };
+  }
+
+  let processedCount = 0;
+  let refundedCount = 0;
+  let failedCount = 0;
+  const errors = [];
+
+  // 1. Process candidate orders
+  if (ordersCollection) {
+    try {
+      const orderFilter = {
+        paymentStatus: "paid",
+        $or: [
+          { refundStatus: "pending_refund" },
+          { refundQueue: true },
+        ],
+        refundStatus: { $ne: "refunded" },
+        $or: [
+          { refundAttempts: { $exists: false } },
+          { refundAttempts: { $lt: maxRetries } },
+        ],
+      };
+
+      const candidateOrders = await ordersCollection
+        .find({
+          paymentStatus: "paid",
+          refundStatus: { $in: ["pending_refund", undefined] },
+          $or: [
+            { orderStatus: "cancelled" },
+            { orderStatus: "rejected" },
+            { refundQueue: true },
+          ],
+        })
+        .limit(maxBatch)
+        .toArray();
+
+      for (const order of candidateOrders) {
+        if (order.refundStatus === "refunded") continue;
+        if ((order.refundAttempts || 0) >= maxRetries) continue;
+
+        // Atomic claim
+        const claimFilter = {
+          _id: order._id,
+          refundStatus: { $ne: "refunded" },
+          $or: [
+            { refundClaimedAt: { $exists: false } },
+            { refundClaimedAt: null },
+            { refundClaimedAt: { $lt: staleClaimThreshold } },
+          ],
+        };
+
+        const claimRes = await ordersCollection.updateOne(claimFilter, {
+          $set: { refundClaimedAt: now },
+          $inc: { refundAttempts: 1 },
+        });
+
+        if (!claimRes || claimRes.matchedCount === 0) {
+          // Claimed by another worker
+          continue;
+        }
+
+        processedCount++;
+
+        // Determine payment intent ID
+        let paymentIntentId = order.transactionId;
+        if ((!paymentIntentId || !paymentIntentId.startsWith("pi_")) && paymentsCollection) {
+          const paymentDoc = await paymentsCollection.findOne({
+            $or: [
+              { orderId: order._id },
+              { session_id: order.paymentId },
+            ],
+          });
+          if (paymentDoc && paymentDoc.transactionId && paymentDoc.transactionId.startsWith("pi_")) {
+            paymentIntentId = paymentDoc.transactionId;
+          }
+        }
+
+        if (!paymentIntentId || typeof paymentIntentId !== "string" || !paymentIntentId.startsWith("pi_")) {
+          // Cannot execute refund without valid Stripe PaymentIntent
+          await ordersCollection.updateOne(
+            { _id: order._id },
+            {
+              $set: {
+                refundError: "Missing or invalid Stripe PaymentIntent identifier",
+                updatedAt: new Date(),
+              },
+              $unset: { refundClaimedAt: "" },
+            }
+          );
+          failedCount++;
+          continue;
+        }
+
+        const idempotencyKey = getRefundIdempotencyKey(order._id, "order_cancel");
+
+        try {
+          const refund = await stripe.refunds.create(
+            {
+              payment_intent: paymentIntentId,
+              reason: order.orderStatus === "rejected" ? "duplicate" : "requested_by_customer",
+            },
+            { idempotencyKey }
+          );
+
+          if (refund && (refund.status === "succeeded" || refund.status === "pending")) {
+            const finalStatus = refund.status === "succeeded" ? "refunded" : "pending_refund";
+            await ordersCollection.updateOne(
+              { _id: order._id },
+              {
+                $set: {
+                  refundStatus: finalStatus,
+                  refundId: refund.id,
+                  refundQueue: finalStatus !== "refunded",
+                  refundSuccessAt: new Date(),
+                  updatedAt: new Date(),
+                },
+                $unset: { refundClaimedAt: "", refundError: "" },
+              }
+            );
+
+            if (paymentsCollection) {
+              await paymentsCollection.updateOne(
+                { $or: [{ orderId: order._id }, { session_id: order.paymentId }] },
+                {
+                  $set: {
+                    refundStatus: finalStatus,
+                    refundId: refund.id,
+                    refundQueue: finalStatus !== "refunded",
+                    updatedAt: new Date(),
+                  },
+                }
+              );
+            }
+
+            if (finalStatus === "refunded") refundedCount++;
+          }
+        } catch (err) {
+          const attempts = (order.refundAttempts || 0) + 1;
+          const isMaxRetries = attempts >= maxRetries;
+          await ordersCollection.updateOne(
+            { _id: order._id },
+            {
+              $set: {
+                refundError: err.message || String(err),
+                refundStatus: isMaxRetries ? "failed_max_retries" : "pending_refund",
+                refundQueue: !isMaxRetries,
+                updatedAt: new Date(),
+              },
+              $unset: { refundClaimedAt: "" },
+            }
+          );
+          failedCount++;
+          errors.push({ orderId: order._id, error: err.message });
+        }
+      }
+    } catch (orderScanErr) {
+      console.error("Error scanning pending order refunds:", orderScanErr.message);
+    }
+  }
+
+  // 2. Process candidate payments (e.g. double-sale failed refunds)
+  if (paymentsCollection) {
+    try {
+      const candidatePayments = await paymentsCollection
+        .find({
+          refundQueue: true,
+          refundStatus: { $ne: "refunded" },
+        })
+        .limit(maxBatch)
+        .toArray();
+
+      for (const payment of candidatePayments) {
+        if (payment.refundStatus === "refunded") continue;
+        if ((payment.refundAttempts || 0) >= maxRetries) continue;
+
+        // Atomic claim
+        const claimRes = await paymentsCollection.updateOne(
+          {
+            _id: payment._id,
+            refundStatus: { $ne: "refunded" },
+            $or: [
+              { refundClaimedAt: { $exists: false } },
+              { refundClaimedAt: null },
+              { refundClaimedAt: { $lt: staleClaimThreshold } },
+            ],
+          },
+          {
+            $set: { refundClaimedAt: now },
+            $inc: { refundAttempts: 1 },
+          }
+        );
+
+        if (!claimRes || claimRes.matchedCount === 0) continue;
+
+        processedCount++;
+
+        const paymentIntentId = payment.transactionId;
+        if (!paymentIntentId || !paymentIntentId.startsWith("pi_")) {
+          await paymentsCollection.updateOne(
+            { _id: payment._id },
+            {
+              $set: { refundError: "Missing valid PaymentIntent ID", updatedAt: new Date() },
+              $unset: { refundClaimedAt: "" },
+            }
+          );
+          failedCount++;
+          continue;
+        }
+
+        const idempotencyKey = getRefundIdempotencyKey(
+          payment.session_id || payment._id,
+          "duplicate"
+        );
+
+        try {
+          const refund = await stripe.refunds.create(
+            {
+              payment_intent: paymentIntentId,
+              reason: "duplicate",
+            },
+            { idempotencyKey }
+          );
+
+          if (refund && (refund.status === "succeeded" || refund.status === "pending")) {
+            const finalStatus = refund.status === "succeeded" ? "refunded" : "pending_refund";
+            await paymentsCollection.updateOne(
+              { _id: payment._id },
+              {
+                $set: {
+                  refundStatus: finalStatus,
+                  refundId: refund.id,
+                  refundQueue: finalStatus !== "refunded",
+                  refundSuccessAt: new Date(),
+                  updatedAt: new Date(),
+                },
+                $unset: { refundClaimedAt: "", refundError: "" },
+              }
+            );
+            if (finalStatus === "refunded") refundedCount++;
+          }
+        } catch (err) {
+          const attempts = (payment.refundAttempts || 0) + 1;
+          const isMaxRetries = attempts >= maxRetries;
+          await paymentsCollection.updateOne(
+            { _id: payment._id },
+            {
+              $set: {
+                refundError: err.message || String(err),
+                refundStatus: isMaxRetries ? "failed_max_retries" : "pending_refund",
+                refundQueue: !isMaxRetries,
+                updatedAt: new Date(),
+              },
+              $unset: { refundClaimedAt: "" },
+            }
+          );
+          failedCount++;
+          errors.push({ paymentId: payment._id, error: err.message });
+        }
+      }
+    } catch (paymentScanErr) {
+      console.error("Error scanning pending payment refunds:", paymentScanErr.message);
+    }
+  }
+
+  return {
+    processed: processedCount,
+    refunded: refundedCount,
+    failed: failedCount,
+    errors,
+  };
+}
+
+/**
+ * Starts periodic background refund recovery worker.
+ */
+function startRefundRecoveryWorker(intervalMs = 300000) {
+  if (recoveryTimer) return recoveryTimer;
+
+  // Run initial pass after brief 5s warm-up
+  const initialTimeout = setTimeout(() => {
+    processPendingRefunds().catch((err) =>
+      console.warn("Initial refund recovery pass warning:", err.message)
+    );
+  }, 5000);
+  if (initialTimeout.unref) initialTimeout.unref();
+
+  recoveryTimer = setInterval(() => {
+    processPendingRefunds().catch((err) =>
+      console.warn("Periodic refund recovery pass warning:", err.message)
+    );
+  }, intervalMs);
+
+  if (recoveryTimer.unref) recoveryTimer.unref();
+  return recoveryTimer;
+}
+
+/**
+ * Stops periodic background refund recovery worker.
+ */
+function stopRefundRecoveryWorker() {
+  if (recoveryTimer) {
+    clearInterval(recoveryTimer);
+    recoveryTimer = null;
+  }
+}
+
+module.exports = {
+  processPendingRefunds,
+  startRefundRecoveryWorker,
+  stopRefundRecoveryWorker,
+  getRefundIdempotencyKey,
+};

@@ -1,7 +1,7 @@
 const express = require("express");
 const { validateEnv, config } = require("./src/config/env");
 const { corsMiddleware } = require("./src/middleware/cors");
-const { client, setCollections, run } = require("./src/config/db");
+const { client, setCollections, run, close, createIndexes } = require("./src/config/db");
 const { setStripeInstance } = require("./src/config/stripe");
 const {
   verifyToken,
@@ -68,10 +68,23 @@ app.use(notFoundHandler);
 app.use(errorHandler);
 
 if (require.main === module) {
-  run().catch(console.dir);
-  app.listen(port, () => {
-    console.log(`ReSell Hub Server listening on port ${port}`);
-  });
+  run()
+    .then(() => {
+      const { startRefundRecoveryWorker } = require("./src/utils/refundRecovery");
+      startRefundRecoveryWorker();
+
+      const server = app.listen(port, () => {
+        console.log(`ReSell Hub Server listening on port ${port}`);
+      });
+      return server;
+    })
+    .catch((err) => {
+      console.error(
+        "Fatal startup error: Failed to connect to database or initialize indexes:",
+        err.message || err
+      );
+      process.exit(1);
+    });
 }
 
 module.exports = {
@@ -84,5 +97,7 @@ module.exports = {
   setVerificationKey,
   setStripeInstance,
   run,
+  close,
+  createIndexes,
   client,
 };

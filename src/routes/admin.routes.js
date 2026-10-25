@@ -3,6 +3,7 @@ const { ObjectId } = require("mongodb");
 const { getCollections } = require("../config/db");
 const { verifyToken, requireRole } = require("../middleware/auth");
 const { escapeRegex } = require("../utils/helpers");
+const { processPendingRefunds } = require("../utils/refundRecovery");
 
 const router = express.Router();
 
@@ -733,4 +734,29 @@ router.get(
   }
 );
 
+/**
+ * POST /api/admin/refunds/process-queue
+ * Administrative recovery endpoint to trigger processing of durable pending refund queue.
+ */
+router.post(
+  "/api/admin/refunds/process-queue",
+  verifyToken,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { maxBatch, maxRetries } = req.body || {};
+      const result = await processPendingRefunds({ maxBatch, maxRetries });
+      res.status(200).json({
+        success: true,
+        message: "Refund recovery queue processed",
+        ...result,
+      });
+    } catch (error) {
+      console.error("Admin refund queue processing error:", error.message || error);
+      res.status(500).json({ message: "Failed to process refund recovery queue" });
+    }
+  }
+);
+
 module.exports = router;
+

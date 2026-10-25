@@ -3,6 +3,7 @@ const { ObjectId } = require("mongodb");
 const { getCollections } = require("../config/db");
 const { getStripeInstance } = require("../config/stripe");
 const { toStripeAmount, fromStripeAmount } = require("../utils/helpers");
+const { getRefundIdempotencyKey } = require("../utils/refundRecovery");
 
 const router = express.Router();
 
@@ -62,8 +63,12 @@ router.post(
     }
 
     // Ensure database connection is ready
-    const { paymentsCollection, ordersCollection, productsCollection } =
-      getCollections();
+    const {
+      paymentsCollection,
+      ordersCollection,
+      productsCollection,
+      processedEventsCollection,
+    } = getCollections();
     if (!paymentsCollection || !ordersCollection) {
       console.error("Stripe webhook error: Database collections not ready");
       return res
@@ -71,14 +76,137 @@ router.post(
         .json({ error: "Service unavailable: Database not connected" });
     }
 
+    const eventId = event.id;
     const sessionId = event.data?.object?.id;
-    if (sessionId && inFlightSessions.has(sessionId)) {
-      return res
-        .status(200)
-        .json({ received: true, message: "Webhook event currently processing" });
+
+    // Durable event tracking & atomic claim to prevent concurrent duplicate processing
+    const now = new Date();
+    const lockTimeoutMs = 120 * 1000; // 2 minutes lock timeout for crash recovery
+    const claimExpiresAt = new Date(Date.now() + lockTimeoutMs);
+    let eventClaimed = false;
+
+    if (processedEventsCollection && eventId) {
+      try {
+        await processedEventsCollection.insertOne({
+          eventId,
+          eventType: event.type,
+          sessionId: sessionId || null,
+          status: "processing",
+          startedAt: now,
+          claimExpiresAt,
+          updatedAt: now,
+        });
+        eventClaimed = true;
+      } catch (insertErr) {
+        if (insertErr.code === 11000) {
+          // Document already exists in processed_events
+        } else {
+          throw insertErr;
+        }
+      }
+
+      if (!eventClaimed) {
+        const existingRecord = await processedEventsCollection.findOne({ eventId });
+        if (existingRecord && existingRecord.status === "completed") {
+          return res.status(200).json({
+            received: true,
+            message: "Event already processed",
+          });
+        }
+
+        const isStale =
+          existingRecord &&
+          existingRecord.claimExpiresAt &&
+          new Date(existingRecord.claimExpiresAt) <= now;
+        const isFailed = existingRecord && existingRecord.status === "failed";
+
+        if (isStale || isFailed) {
+          const reclaimResult = await processedEventsCollection.updateOne(
+            {
+              eventId,
+              $or: [
+                { status: "failed" },
+                { status: "processing", claimExpiresAt: { $lte: now } },
+              ],
+            },
+            {
+              $set: {
+                status: "processing",
+                startedAt: now,
+                claimExpiresAt,
+                reclaimedAt: now,
+                updatedAt: now,
+              },
+              $unset: { lastError: "", failedAt: "" },
+            }
+          );
+          if (reclaimResult.modifiedCount > 0) {
+            eventClaimed = true;
+          }
+        }
+      }
+
+      if (!eventClaimed) {
+        // Another worker is actively processing. Wait briefly for simultaneous completion.
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          const checkEvt = await processedEventsCollection.findOne({ eventId });
+          if (checkEvt && checkEvt.status === "completed") {
+            return res.status(200).json({
+              received: true,
+              message: "Simultaneous processing completed",
+            });
+          }
+        }
+        res.setHeader("Retry-After", "5");
+        return res.status(503).json({
+          error: "Webhook event is currently processing. Please retry.",
+        });
+      }
+    } else {
+      // In-flight concurrency protection when processedEventsCollection is not present
+      if (sessionId && inFlightSessions.has(sessionId)) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          if (!inFlightSessions.has(sessionId)) {
+            const existingPayment = await paymentsCollection.findOne({
+              $or: [{ session_id: sessionId }, { transactionId: sessionId }],
+            });
+            if (existingPayment) {
+              return res.status(200).json({
+                received: true,
+                message: "Simultaneous processing completed",
+              });
+            }
+            break;
+          }
+        }
+        if (inFlightSessions.has(sessionId)) {
+          res.setHeader("Retry-After", "5");
+          return res.status(503).json({
+            error: "Webhook event currently processing. Please retry.",
+          });
+        }
+      }
     }
+
     if (sessionId) {
       inFlightSessions.add(sessionId);
+    }
+
+    async function markEventCompleted() {
+      if (processedEventsCollection && eventId) {
+        await processedEventsCollection.updateOne(
+          { eventId },
+          {
+            $set: {
+              status: "completed",
+              completedAt: new Date(),
+              updatedAt: new Date(),
+            },
+          }
+        );
+      }
     }
 
     try {
@@ -91,6 +219,7 @@ router.post(
             console.log(
               `Stripe webhook: Checkout session ${session.id} payment_status is '${session.payment_status}', skipping order creation`
             );
+            await markEventCompleted();
             return res
               .status(200)
               .json({ received: true, status: session.payment_status });
@@ -118,12 +247,20 @@ router.post(
               : null);
 
           if (existingPayment && existingOrder) {
-            console.log(
-              `Stripe webhook: Session ${currentSessionId} already processed (idempotent skip)`
-            );
-            return res
-              .status(200)
-              .json({ received: true, message: "Already processed" });
+            const isResolvedCancelled =
+              existingOrder.orderStatus === "cancelled" &&
+              (existingOrder.refundStatus === "refunded" ||
+                existingPayment.refundStatus === "refunded");
+
+            if (existingOrder.orderStatus !== "cancelled" || isResolvedCancelled) {
+              console.log(
+                `Stripe webhook: Session ${currentSessionId} already processed (idempotent skip)`
+              );
+              await markEventCompleted();
+              return res
+                .status(200)
+                .json({ received: true, message: "Already processed" });
+            }
           }
 
           // 2. Retrieve authoritative product & price from database
@@ -216,14 +353,16 @@ router.post(
             }
           }
 
-          // Duplicate Payment Reconciliation & Automatic Refund Processing:
-          // Attempt an immediate Stripe refund. If confirmed by Stripe, status is 'refunded'.
-          // Otherwise, it is safely queued with status 'pending_refund' in a durable queue.
+          // Check if order was cancelled before webhook arrival
+          const isOrderCancelled =
+            existingOrder && existingOrder.orderStatus === "cancelled";
+
+          // Duplicate Payment Reconciliation & Cancelled Order Automatic Refund Processing:
           let refundResult = null;
-          let refundStatus = isDoubleSale ? "pending_refund" : undefined;
+          let refundStatus = (isDoubleSale || isOrderCancelled) ? "pending_refund" : undefined;
           let refundError = null;
 
-          if (isDoubleSale && paymentIntentId) {
+          if ((isDoubleSale || isOrderCancelled) && paymentIntentId) {
             try {
               const stripe = getStripeInstance();
               if (
@@ -231,10 +370,20 @@ router.post(
                 stripe.refunds &&
                 typeof stripe.refunds.create === "function"
               ) {
-                const refund = await stripe.refunds.create({
-                  payment_intent: paymentIntentId,
-                  reason: "duplicate",
-                });
+                const idempotencyKey =
+                  isOrderCancelled && existingOrder
+                    ? getRefundIdempotencyKey(existingOrder._id, "order_cancel")
+                    : getRefundIdempotencyKey(currentSessionId, "duplicate");
+
+                const reason = isDoubleSale ? "duplicate" : "requested_by_customer";
+
+                const refund = await stripe.refunds.create(
+                  {
+                    payment_intent: paymentIntentId,
+                    reason,
+                  },
+                  { idempotencyKey }
+                );
                 if (refund && refund.status === "succeeded") {
                   refundResult = refund;
                   refundStatus = "refunded";
@@ -246,7 +395,7 @@ router.post(
             } catch (rErr) {
               refundError = rErr.message || String(rErr);
               console.error(
-                "Stripe automatic refund attempt error for duplicate purchase:",
+                `Stripe automatic refund attempt error (${isDoubleSale ? "duplicate" : "order_cancel"}):`,
                 refundError
               );
             }
@@ -256,7 +405,21 @@ router.post(
           let orderId = null;
           if (existingOrder) {
             orderId = existingOrder._id;
-            if (existingOrder.paymentStatus !== "paid") {
+            if (isOrderCancelled) {
+              await ordersCollection.updateOne(
+                { _id: existingOrder._id },
+                {
+                  $set: {
+                    paymentStatus: "paid",
+                    refundStatus,
+                    refundId: refundResult ? refundResult.id : undefined,
+                    refundQueue: refundStatus !== "refunded",
+                    refundError: refundError || undefined,
+                    updatedAt: new Date(),
+                  },
+                }
+              );
+            } else if (existingOrder.paymentStatus !== "paid") {
               await ordersCollection.updateOne(
                 { _id: existingOrder._id },
                 { $set: { paymentStatus: "paid", updatedAt: new Date() } }
@@ -281,6 +444,8 @@ router.post(
                 : undefined,
               refundStatus: isDoubleSale ? refundStatus : undefined,
               refundId: refundResult ? refundResult.id : undefined,
+              refundError: refundError || undefined,
+              refundQueue: isDoubleSale && refundStatus !== "refunded",
               createdAt: new Date(),
             };
             try {
@@ -291,6 +456,7 @@ router.post(
                 console.log(
                   `Stripe webhook: Order for session ${currentSessionId} already exists (concurrent insert caught)`
                 );
+                await markEventCompleted();
                 return res.status(200).json({ received: true, message: "Already processed" });
               }
               throw insertErr;
@@ -302,18 +468,22 @@ router.post(
             const paymentDoc = {
               session_id: currentSessionId,
               transactionId: paymentIntentId || currentSessionId,
-              orderId,
+              orderId: existingOrder ? existingOrder._id : orderId,
               amount:
                 session.amount_total != null
                   ? fromStripeAmount(session.amount_total, sessionCurrency)
                   : authoritativePrice,
               currency: sessionCurrency,
               paymentStatus: "paid",
-              fulfillmentStatus: isDoubleSale ? "failed_duplicate_purchase" : "fulfilled",
-              refundStatus: isDoubleSale ? refundStatus : undefined,
+              fulfillmentStatus: isDoubleSale
+                ? "failed_duplicate_purchase"
+                : isOrderCancelled
+                ? "cancelled_order_refunded"
+                : "fulfilled",
+              refundStatus: (isDoubleSale || isOrderCancelled) ? refundStatus : undefined,
               refundId: refundResult ? refundResult.id : undefined,
               refundError: refundError || undefined,
-              refundQueue: isDoubleSale && refundStatus !== "refunded",
+              refundQueue: (isDoubleSale || isOrderCancelled) && refundStatus !== "refunded",
               metadata: {
                 ...metadata,
                 userEmail: buyerEmail,
@@ -330,14 +500,15 @@ router.post(
                 console.log(
                   `Stripe webhook: Payment for session ${currentSessionId} already exists (concurrent insert caught)`
                 );
+                await markEventCompleted();
                 return res.status(200).json({ received: true, message: "Already processed" });
               }
               throw insertErr;
             }
           }
 
-          // 5. Update product status to sold in database (only if not already sold to another buyer)
-          if (!isDoubleSale && productsCollection && productId) {
+          // 5. Update product status to sold in database (only if not already sold and not cancelled order)
+          if (!isDoubleSale && !isOrderCancelled && productsCollection && productId) {
             const productQuery = ObjectId.isValid(productId)
               ? { _id: new ObjectId(productId) }
               : { _id: productId };
@@ -348,14 +519,31 @@ router.post(
                 soldPaymentId: currentSessionId,
                 updatedAt: new Date(),
               },
-              $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "" },
+              $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "", reservationSessionUrl: "" },
             });
+          } else if (isOrderCancelled && productsCollection && productId) {
+            // Clean up any remaining provisional reservation for this session so product remains available
+            const productQuery = ObjectId.isValid(productId)
+              ? { _id: new ObjectId(productId) }
+              : { _id: productId };
+            await productsCollection.updateOne(
+              {
+                ...productQuery,
+                reservationSessionId: currentSessionId,
+                status: "reserved",
+              },
+              {
+                $set: { status: "available", updatedAt: new Date() },
+                $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "", reservationSessionUrl: "" },
+              }
+            );
           }
 
           console.log(
-            `Stripe webhook: Successfully processed checkout.session.completed for session ${currentSessionId}${isDoubleSale ? " (flagged duplicate sale)" : ""}`
+            `Stripe webhook: Successfully processed checkout.session.completed for session ${currentSessionId}${isDoubleSale ? " (flagged duplicate sale)" : ""}${isOrderCancelled ? " (cancelled order refunded)" : ""}`
           );
-          return res.status(200).json({ received: true, doubleSale: isDoubleSale });
+          await markEventCompleted();
+          return res.status(200).json({ received: true, doubleSale: isDoubleSale, cancelled: isOrderCancelled });
         }
 
         case "checkout.session.expired": {
@@ -375,10 +563,11 @@ router.post(
               },
               {
                 $set: { status: "available", updatedAt: new Date() },
-                $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "" },
+                $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "", reservationSessionUrl: "" },
               }
             );
           }
+          await markEventCompleted();
           return res.status(200).json({ received: true, status: "expired" });
         }
 
@@ -397,11 +586,13 @@ router.post(
               }
             );
           }
+          await markEventCompleted();
           return res.status(200).json({ received: true, status: "failed" });
         }
 
         default:
           console.log(`Stripe webhook: Unhandled event type ${event.type}`);
+          await markEventCompleted();
           return res.status(200).json({ received: true, unhandled: true });
       }
     } catch (processError) {
@@ -409,6 +600,26 @@ router.post(
         "Stripe webhook processing error:",
         processError.message || processError
       );
+      if (processedEventsCollection && eventId) {
+        try {
+          await processedEventsCollection.updateOne(
+            { eventId },
+            {
+              $set: {
+                status: "failed",
+                failedAt: new Date(),
+                lastError: processError.message || String(processError),
+                updatedAt: new Date(),
+              },
+            }
+          );
+        } catch (dbErr) {
+          console.error(
+            "Failed to update processed_events failure status:",
+            dbErr.message
+          );
+        }
+      }
       return res.status(500).json({ error: "Failed to process webhook event" });
     } finally {
       if (sessionId) {
