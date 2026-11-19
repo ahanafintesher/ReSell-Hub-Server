@@ -23,7 +23,7 @@ router.post(
 
     if (!webhookSecret) {
       console.error(
-        "Stripe webhook configuration error: STRIPE_WEBHOOK_SECRET is not configured"
+        "Stripe webhook configuration error: STRIPE_WEBHOOK_SECRET is not configured",
       );
       return res
         .status(500)
@@ -31,12 +31,11 @@ router.post(
     }
 
     if (!sig) {
+     
       console.error(
-        "Stripe webhook verification error: Missing stripe-signature header"
+        "Stripe webhook verification error: Missing stripe-signature header",
       );
-      return res
-        .status(400)
-        .json({ error: "Missing stripe-signature header" });
+      return res.status(400).json({ error: "Missing stripe-signature header" });
     }
 
     if (!req.body || (Buffer.isBuffer(req.body) && req.body.length === 0)) {
@@ -50,12 +49,12 @@ router.post(
       event = stripeInstance.webhooks.constructEvent(
         req.body,
         sig,
-        webhookSecret
+        webhookSecret,
       );
     } catch (err) {
       console.error(
         "Stripe webhook signature verification failed:",
-        err.message
+        err.message,
       );
       return res.status(400).json({
         error: `Webhook signature verification failed: ${err.message}`,
@@ -106,7 +105,9 @@ router.post(
       }
 
       if (!eventClaimed) {
-        const existingRecord = await processedEventsCollection.findOne({ eventId });
+        const existingRecord = await processedEventsCollection.findOne({
+          eventId,
+        });
         if (existingRecord && existingRecord.status === "completed") {
           return res.status(200).json({
             received: true,
@@ -138,7 +139,7 @@ router.post(
                 updatedAt: now,
               },
               $unset: { lastError: "", failedAt: "" },
-            }
+            },
           );
           if (reclaimResult.modifiedCount > 0) {
             eventClaimed = true;
@@ -204,7 +205,7 @@ router.post(
               completedAt: new Date(),
               updatedAt: new Date(),
             },
-          }
+          },
         );
       }
     }
@@ -217,7 +218,7 @@ router.post(
           // Only process paid checkout sessions
           if (session.payment_status !== "paid") {
             console.log(
-              `Stripe webhook: Checkout session ${session.id} payment_status is '${session.payment_status}', skipping order creation`
+              `Stripe webhook: Checkout session ${session.id} payment_status is '${session.payment_status}', skipping order creation`,
             );
             await markEventCompleted();
             return res
@@ -232,13 +233,17 @@ router.post(
 
           // 1. Idempotency Check: check if already processed in payments or orders
           const existingPayment =
-            (await paymentsCollection.findOne({ session_id: currentSessionId })) ||
+            (await paymentsCollection.findOne({
+              session_id: currentSessionId,
+            })) ||
             (paymentIntentId
               ? await paymentsCollection.findOne({
                   transactionId: paymentIntentId,
                 })
               : null) ||
-            (await paymentsCollection.findOne({ transactionId: currentSessionId }));
+            (await paymentsCollection.findOne({
+              transactionId: currentSessionId,
+            }));
 
           const existingOrder =
             (await ordersCollection.findOne({ paymentId: currentSessionId })) ||
@@ -252,9 +257,12 @@ router.post(
               (existingOrder.refundStatus === "refunded" ||
                 existingPayment.refundStatus === "refunded");
 
-            if (existingOrder.orderStatus !== "cancelled" || isResolvedCancelled) {
+            if (
+              existingOrder.orderStatus !== "cancelled" ||
+              isResolvedCancelled
+            ) {
               console.log(
-                `Stripe webhook: Session ${currentSessionId} already processed (idempotent skip)`
+                `Stripe webhook: Session ${currentSessionId} already processed (idempotent skip)`,
               );
               await markEventCompleted();
               return res
@@ -277,7 +285,10 @@ router.post(
           let authoritativePrice;
           if (product && product.price != null) {
             authoritativePrice = Number(product.price);
-            const expectedAmountSubunits = toStripeAmount(authoritativePrice, sessionCurrency);
+            const expectedAmountSubunits = toStripeAmount(
+              authoritativePrice,
+              sessionCurrency,
+            );
 
             // Security check: Validate against client-manipulated amount in session
             if (
@@ -291,7 +302,7 @@ router.post(
                   paidSubunits: session.amount_total,
                   expectedSubunits: expectedAmountSubunits,
                   productId,
-                }
+                },
               );
               return res.status(400).json({
                 error:
@@ -301,7 +312,10 @@ router.post(
           } else if (metadata.price != null && !isNaN(Number(metadata.price))) {
             authoritativePrice = Number(metadata.price);
           } else if (session.amount_total != null) {
-            authoritativePrice = fromStripeAmount(session.amount_total, sessionCurrency);
+            authoritativePrice = fromStripeAmount(
+              session.amount_total,
+              sessionCurrency,
+            );
           } else {
             authoritativePrice = 0;
           }
@@ -313,9 +327,7 @@ router.post(
             "unknown@example.com";
 
           const buyerName =
-            metadata.buyerName ||
-            session.customer_details?.name ||
-            "Anonymous";
+            metadata.buyerName || session.customer_details?.name || "Anonymous";
 
           const sellerInfo = product
             ? typeof product.sellerInfo === "object"
@@ -344,11 +356,12 @@ router.post(
             if (
               existingProductOrder &&
               existingProductOrder.paymentId !== currentSessionId &&
-              (!paymentIntentId || existingProductOrder.transactionId !== paymentIntentId)
+              (!paymentIntentId ||
+                existingProductOrder.transactionId !== paymentIntentId)
             ) {
               isDoubleSale = true;
               console.warn(
-                `Stripe webhook WARNING: Duplicate purchase attempt detected for product ${productId}. Session ${currentSessionId} paid for already sold item.`
+                `Stripe webhook WARNING: Duplicate purchase attempt detected for product ${productId}. Session ${currentSessionId} paid for already sold item.`,
               );
             }
           }
@@ -359,7 +372,8 @@ router.post(
 
           // Duplicate Payment Reconciliation & Cancelled Order Automatic Refund Processing:
           let refundResult = null;
-          let refundStatus = (isDoubleSale || isOrderCancelled) ? "pending_refund" : undefined;
+          let refundStatus =
+            isDoubleSale || isOrderCancelled ? "pending_refund" : undefined;
           let refundError = null;
 
           if ((isDoubleSale || isOrderCancelled) && paymentIntentId) {
@@ -375,14 +389,16 @@ router.post(
                     ? getRefundIdempotencyKey(existingOrder._id, "order_cancel")
                     : getRefundIdempotencyKey(currentSessionId, "duplicate");
 
-                const reason = isDoubleSale ? "duplicate" : "requested_by_customer";
+                const reason = isDoubleSale
+                  ? "duplicate"
+                  : "requested_by_customer";
 
                 const refund = await stripe.refunds.create(
                   {
                     payment_intent: paymentIntentId,
                     reason,
                   },
-                  { idempotencyKey }
+                  { idempotencyKey },
                 );
                 if (refund && refund.status === "succeeded") {
                   refundResult = refund;
@@ -396,7 +412,7 @@ router.post(
               refundError = rErr.message || String(rErr);
               console.error(
                 `Stripe automatic refund attempt error (${isDoubleSale ? "duplicate" : "order_cancel"}):`,
-                refundError
+                refundError,
               );
             }
           }
@@ -417,12 +433,12 @@ router.post(
                     refundError: refundError || undefined,
                     updatedAt: new Date(),
                   },
-                }
+                },
               );
             } else if (existingOrder.paymentStatus !== "paid") {
               await ordersCollection.updateOne(
                 { _id: existingOrder._id },
-                { $set: { paymentStatus: "paid", updatedAt: new Date() } }
+                { $set: { paymentStatus: "paid", updatedAt: new Date() } },
               );
             }
           } else {
@@ -454,10 +470,12 @@ router.post(
             } catch (insertErr) {
               if (insertErr.code === 11000) {
                 console.log(
-                  `Stripe webhook: Order for session ${currentSessionId} already exists (concurrent insert caught)`
+                  `Stripe webhook: Order for session ${currentSessionId} already exists (concurrent insert caught)`,
                 );
                 await markEventCompleted();
-                return res.status(200).json({ received: true, message: "Already processed" });
+                return res
+                  .status(200)
+                  .json({ received: true, message: "Already processed" });
               }
               throw insertErr;
             }
@@ -478,12 +496,15 @@ router.post(
               fulfillmentStatus: isDoubleSale
                 ? "failed_duplicate_purchase"
                 : isOrderCancelled
-                ? "cancelled_order_refunded"
-                : "fulfilled",
-              refundStatus: (isDoubleSale || isOrderCancelled) ? refundStatus : undefined,
+                  ? "cancelled_order_refunded"
+                  : "fulfilled",
+              refundStatus:
+                isDoubleSale || isOrderCancelled ? refundStatus : undefined,
               refundId: refundResult ? refundResult.id : undefined,
               refundError: refundError || undefined,
-              refundQueue: (isDoubleSale || isOrderCancelled) && refundStatus !== "refunded",
+              refundQueue:
+                (isDoubleSale || isOrderCancelled) &&
+                refundStatus !== "refunded",
               metadata: {
                 ...metadata,
                 userEmail: buyerEmail,
@@ -498,17 +519,24 @@ router.post(
             } catch (insertErr) {
               if (insertErr.code === 11000) {
                 console.log(
-                  `Stripe webhook: Payment for session ${currentSessionId} already exists (concurrent insert caught)`
+                  `Stripe webhook: Payment for session ${currentSessionId} already exists (concurrent insert caught)`,
                 );
                 await markEventCompleted();
-                return res.status(200).json({ received: true, message: "Already processed" });
+                return res
+                  .status(200)
+                  .json({ received: true, message: "Already processed" });
               }
               throw insertErr;
             }
           }
 
           // 5. Update product status to sold in database (only if not already sold and not cancelled order)
-          if (!isDoubleSale && !isOrderCancelled && productsCollection && productId) {
+          if (
+            !isDoubleSale &&
+            !isOrderCancelled &&
+            productsCollection &&
+            productId
+          ) {
             const productQuery = ObjectId.isValid(productId)
               ? { _id: new ObjectId(productId) }
               : { _id: productId };
@@ -519,7 +547,12 @@ router.post(
                 soldPaymentId: currentSessionId,
                 updatedAt: new Date(),
               },
-              $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "", reservationSessionUrl: "" },
+              $unset: {
+                reservedBy: "",
+                reservedUntil: "",
+                reservationSessionId: "",
+                reservationSessionUrl: "",
+              },
             });
           } else if (isOrderCancelled && productsCollection && productId) {
             // Clean up any remaining provisional reservation for this session so product remains available
@@ -534,16 +567,25 @@ router.post(
               },
               {
                 $set: { status: "available", updatedAt: new Date() },
-                $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "", reservationSessionUrl: "" },
-              }
+                $unset: {
+                  reservedBy: "",
+                  reservedUntil: "",
+                  reservationSessionId: "",
+                  reservationSessionUrl: "",
+                },
+              },
             );
           }
 
           console.log(
-            `Stripe webhook: Successfully processed checkout.session.completed for session ${currentSessionId}${isDoubleSale ? " (flagged duplicate sale)" : ""}${isOrderCancelled ? " (cancelled order refunded)" : ""}`
+            `Stripe webhook: Successfully processed checkout.session.completed for session ${currentSessionId}${isDoubleSale ? " (flagged duplicate sale)" : ""}${isOrderCancelled ? " (cancelled order refunded)" : ""}`,
           );
           await markEventCompleted();
-          return res.status(200).json({ received: true, doubleSale: isDoubleSale, cancelled: isOrderCancelled });
+          return res.status(200).json({
+            received: true,
+            doubleSale: isDoubleSale,
+            cancelled: isOrderCancelled,
+          });
         }
 
         case "checkout.session.expired": {
@@ -563,8 +605,13 @@ router.post(
               },
               {
                 $set: { status: "available", updatedAt: new Date() },
-                $unset: { reservedBy: "", reservedUntil: "", reservationSessionId: "", reservationSessionUrl: "" },
-              }
+                $unset: {
+                  reservedBy: "",
+                  reservedUntil: "",
+                  reservationSessionId: "",
+                  reservationSessionUrl: "",
+                },
+              },
             );
           }
           await markEventCompleted();
@@ -583,7 +630,7 @@ router.post(
                     intent.last_payment_error?.message || "Payment failed",
                   updatedAt: new Date(),
                 },
-              }
+              },
             );
           }
           await markEventCompleted();
@@ -598,7 +645,7 @@ router.post(
     } catch (processError) {
       console.error(
         "Stripe webhook processing error:",
-        processError.message || processError
+        processError.message || processError,
       );
       if (processedEventsCollection && eventId) {
         try {
@@ -611,12 +658,12 @@ router.post(
                 lastError: processError.message || String(processError),
                 updatedAt: new Date(),
               },
-            }
+            },
           );
         } catch (dbErr) {
           console.error(
             "Failed to update processed_events failure status:",
-            dbErr.message
+            dbErr.message,
           );
         }
       }
@@ -626,7 +673,7 @@ router.post(
         inFlightSessions.delete(sessionId);
       }
     }
-  }
+  },
 );
 
 module.exports = router;
