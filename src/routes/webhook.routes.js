@@ -423,17 +423,21 @@ router.post(
           if (existingOrder) {
             orderId = existingOrder._id;
             if (isOrderCancelled) {
+              const orderUpdate = {
+                paymentStatus: "paid",
+                refundStatus,
+                refundId: refundResult ? refundResult.id : undefined,
+                refundQueue: refundStatus !== "refunded",
+                refundError: refundError || undefined,
+                updatedAt: new Date(),
+              };
+              if (refundStatus === "refunded") {
+                orderUpdate.refundSuccessAt = new Date();
+              }
               await ordersCollection.updateOne(
                 { _id: existingOrder._id },
                 {
-                  $set: {
-                    paymentStatus: "paid",
-                    refundStatus,
-                    refundId: refundResult ? refundResult.id : undefined,
-                    refundQueue: refundStatus !== "refunded",
-                    refundError: refundError || undefined,
-                    updatedAt: new Date(),
-                  },
+                  $set: orderUpdate,
                 },
               );
             } else if (existingOrder.paymentStatus !== "paid") {
@@ -463,6 +467,10 @@ router.post(
               refundId: refundResult ? refundResult.id : undefined,
               refundError: refundError || undefined,
               refundQueue: isDoubleSale && refundStatus !== "refunded",
+              refundSuccessAt:
+                isDoubleSale && refundStatus === "refunded"
+                  ? new Date()
+                  : undefined,
               createdAt: new Date(),
             };
             try {
@@ -506,6 +514,10 @@ router.post(
               refundQueue:
                 (isDoubleSale || isOrderCancelled) &&
                 refundStatus !== "refunded",
+              refundSuccessAt:
+                (isDoubleSale || isOrderCancelled) && refundStatus === "refunded"
+                  ? new Date()
+                  : undefined,
               metadata: {
                 ...metadata,
                 userEmail: buyerEmail,
@@ -666,6 +678,14 @@ router.post(
               await ordersCollection.updateOne({ _id: orderDoc._id }, { $set: orderUpdate });
 
               if (disputesCollection) {
+                const disputeUpdate = {
+                  refundStatus: finalRefundStatus,
+                  ...(refundId ? { refundId } : {}),
+                  updatedAt: new Date(),
+                };
+                if (isSucceeded) {
+                  disputeUpdate.refundSuccessAt = new Date();
+                }
                 await disputesCollection.updateOne(
                   {
                     $or: [
@@ -674,11 +694,7 @@ router.post(
                     ],
                   },
                   {
-                    $set: {
-                      refundStatus: finalRefundStatus,
-                      ...(refundId ? { refundId } : {}),
-                      updatedAt: new Date(),
-                    },
+                    $set: disputeUpdate,
                   }
                 );
               }
@@ -686,6 +702,15 @@ router.post(
           }
 
           if (paymentsCollection && paymentIntentId) {
+            const paymentUpdate = {
+              refundStatus: finalRefundStatus,
+              refundQueue: !isSucceeded,
+              ...(refundId ? { refundId } : {}),
+              updatedAt: new Date(),
+            };
+            if (isSucceeded) {
+              paymentUpdate.refundSuccessAt = new Date();
+            }
             await paymentsCollection.updateOne(
               {
                 $or: [
@@ -694,12 +719,7 @@ router.post(
                 ],
               },
               {
-                $set: {
-                  refundStatus: finalRefundStatus,
-                  refundQueue: !isSucceeded,
-                  ...(refundId ? { refundId } : {}),
-                  updatedAt: new Date(),
-                },
+                $set: paymentUpdate,
               }
             );
           }

@@ -5,6 +5,16 @@ const { getStripeInstance } = require("../config/stripe");
 let recoveryTimer = null;
 
 /**
+ * Calculates bounded exponential backoff delay based on attempt count.
+ * Base delay: 30 seconds (configurable)
+ * Max delay: 1 hour (3600000 ms)
+ */
+function calculateBackoffDelay(attempts, baseDelayMs = 30000, maxDelayMs = 3600000) {
+  const safeAttempts = Math.max(1, attempts || 1);
+  return Math.min(baseDelayMs * Math.pow(2, safeAttempts - 1), maxDelayMs);
+}
+
+/**
  * Derives a stable, deterministic idempotency key for refunds.
  */
 function getRefundIdempotencyKey(identifier, type = "duplicate") {
@@ -13,11 +23,12 @@ function getRefundIdempotencyKey(identifier, type = "duplicate") {
 
 /**
  * Processes pending refunds from orders and payments collections.
- * Uses atomic claim locks and deterministic Stripe idempotency keys.
+ * Uses atomic claim locks, bounded exponential backoff, and deterministic Stripe idempotency keys.
  */
 async function processPendingRefunds(options = {}) {
   const maxBatch = options.maxBatch || 10;
   const maxRetries = options.maxRetries || 3;
+  const baseDelayMs = options.baseDelayMs || 30000;
   const now = new Date();
   const lockTimeoutMs = 5 * 60 * 1000; // 5 minute claim lock
   const staleClaimThreshold = new Date(now.getTime() - lockTimeoutMs);
@@ -37,27 +48,40 @@ async function processPendingRefunds(options = {}) {
   // 1. Process candidate orders
   if (ordersCollection) {
     try {
-      const orderFilter = {
-        paymentStatus: "paid",
-        $or: [
-          { refundStatus: "pending_refund" },
-          { refundQueue: true },
-        ],
-        refundStatus: { $ne: "refunded" },
-        $or: [
-          { refundAttempts: { $exists: false } },
-          { refundAttempts: { $lt: maxRetries } },
-        ],
-      };
-
       const candidateOrders = await ordersCollection
         .find({
           paymentStatus: "paid",
-          refundStatus: { $in: ["pending_refund", undefined] },
-          $or: [
-            { orderStatus: "cancelled" },
-            { orderStatus: "rejected" },
-            { refundQueue: true },
+          refundStatus: { $ne: "refunded" },
+          $and: [
+            {
+              $or: [
+                { refundQueue: true },
+                { refundStatus: "pending_refund" },
+                { orderStatus: "cancelled" },
+                { orderStatus: "rejected" },
+              ],
+            },
+            {
+              $or: [
+                { refundAttempts: { $exists: false } },
+                { refundAttempts: null },
+                { refundAttempts: { $lt: maxRetries } },
+              ],
+            },
+            {
+              $or: [
+                { nextRetryAt: { $exists: false } },
+                { nextRetryAt: null },
+                { nextRetryAt: { $lte: now } },
+              ],
+            },
+            {
+              $or: [
+                { refundStatus: { $exists: false } },
+                { refundStatus: null },
+                { refundStatus: { $ne: "failed_max_retries" } },
+              ],
+            },
           ],
         })
         .limit(maxBatch)
@@ -65,7 +89,9 @@ async function processPendingRefunds(options = {}) {
 
       for (const order of candidateOrders) {
         if (order.refundStatus === "refunded") continue;
+        if (order.refundStatus === "failed_max_retries") continue;
         if ((order.refundAttempts || 0) >= maxRetries) continue;
+        if (order.nextRetryAt && new Date(order.nextRetryAt) > now) continue;
 
         // Atomic claim
         const claimFilter = {
@@ -106,11 +132,15 @@ async function processPendingRefunds(options = {}) {
 
         if (!paymentIntentId || typeof paymentIntentId !== "string" || !paymentIntentId.startsWith("pi_")) {
           // Cannot execute refund without valid Stripe PaymentIntent
+          const currentAttempts = (order.refundAttempts || 0) + 1;
+          const isMax = currentAttempts >= maxRetries;
           await ordersCollection.updateOne(
             { _id: order._id },
             {
               $set: {
                 refundError: "Missing or invalid Stripe PaymentIntent identifier",
+                refundStatus: isMax ? "failed_max_retries" : (order.refundStatus || "pending_refund"),
+                refundQueue: !isMax,
                 updatedAt: new Date(),
               },
               $unset: { refundClaimedAt: "" },
@@ -136,36 +166,76 @@ async function processPendingRefunds(options = {}) {
           );
 
           if (refund && (refund.status === "succeeded" || refund.status === "pending")) {
-            const finalStatus = refund.status === "succeeded" ? "refunded" : "pending_refund";
+            const isSucceeded = refund.status === "succeeded";
+            const finalStatus = isSucceeded ? "refunded" : "pending_refund";
+            const nowTime = new Date();
+
+            const orderUpdate = {
+              refundStatus: finalStatus,
+              refundId: refund.id,
+              refundQueue: !isSucceeded,
+              updatedAt: nowTime,
+            };
+
+            const orderUnset = {
+              refundClaimedAt: "",
+              refundError: "",
+            };
+
+            if (isSucceeded) {
+              orderUpdate.refundSuccessAt = order.refundSuccessAt || nowTime;
+              orderUnset.nextRetryAt = "";
+            } else {
+              // Pending refund: do NOT assign refundSuccessAt
+              const currentAttempts = (order.refundAttempts || 0) + 1;
+              const delayMs = calculateBackoffDelay(currentAttempts, baseDelayMs);
+              orderUpdate.nextRetryAt = new Date(nowTime.getTime() + delayMs);
+            }
+
             await ordersCollection.updateOne(
               { _id: order._id },
               {
-                $set: {
-                  refundStatus: finalStatus,
-                  refundId: refund.id,
-                  refundQueue: finalStatus !== "refunded",
-                  refundSuccessAt: new Date(),
-                  updatedAt: new Date(),
-                },
-                $unset: { refundClaimedAt: "", refundError: "" },
+                $set: orderUpdate,
+                $unset: orderUnset,
               }
             );
 
             if (paymentsCollection) {
+              const paymentUpdate = {
+                refundStatus: finalStatus,
+                refundId: refund.id,
+                refundQueue: !isSucceeded,
+                updatedAt: nowTime,
+              };
+              const paymentUnset = {
+                refundClaimedAt: "",
+                refundError: "",
+              };
+              if (isSucceeded) {
+                paymentUpdate.refundSuccessAt = order.refundSuccessAt || nowTime;
+                paymentUnset.nextRetryAt = "";
+              } else {
+                paymentUpdate.nextRetryAt = orderUpdate.nextRetryAt;
+              }
+
               await paymentsCollection.updateOne(
                 { $or: [{ orderId: order._id }, { session_id: order.paymentId }] },
                 {
-                  $set: {
-                    refundStatus: finalStatus,
-                    refundId: refund.id,
-                    refundQueue: finalStatus !== "refunded",
-                    updatedAt: new Date(),
-                  },
+                  $set: paymentUpdate,
+                  $unset: paymentUnset,
                 }
               );
             }
 
             if (disputesCollection && isDisputedOrder) {
+              const disputeUpdate = {
+                refundStatus: finalStatus,
+                refundId: refund.id,
+                updatedAt: nowTime,
+              };
+              if (isSucceeded) {
+                disputeUpdate.refundSuccessAt = order.refundSuccessAt || nowTime;
+              }
               await disputesCollection.updateOne(
                 {
                   $or: [
@@ -174,30 +244,38 @@ async function processPendingRefunds(options = {}) {
                   ],
                 },
                 {
-                  $set: {
-                    refundStatus: finalStatus,
-                    refundId: refund.id,
-                    updatedAt: new Date(),
-                  },
+                  $set: disputeUpdate,
                 }
               );
             }
 
-            if (finalStatus === "refunded") refundedCount++;
+            if (isSucceeded) refundedCount++;
           }
         } catch (err) {
           const attempts = (order.refundAttempts || 0) + 1;
           const isMaxRetries = attempts >= maxRetries;
+          const delayMs = calculateBackoffDelay(attempts, baseDelayMs);
+          const nextRetryAt = new Date(now.getTime() + delayMs);
+
+          const errUpdate = {
+            refundError: err.message || String(err),
+            refundStatus: isMaxRetries ? "failed_max_retries" : "pending_refund",
+            refundQueue: !isMaxRetries,
+            updatedAt: new Date(),
+          };
+          const errUnset = { refundClaimedAt: "" };
+
+          if (!isMaxRetries) {
+            errUpdate.nextRetryAt = nextRetryAt;
+          } else {
+            errUnset.nextRetryAt = "";
+          }
+
           await ordersCollection.updateOne(
             { _id: order._id },
             {
-              $set: {
-                refundError: err.message || String(err),
-                refundStatus: isMaxRetries ? "failed_max_retries" : "pending_refund",
-                refundQueue: !isMaxRetries,
-                updatedAt: new Date(),
-              },
-              $unset: { refundClaimedAt: "" },
+              $set: errUpdate,
+              $unset: errUnset,
             }
           );
           failedCount++;
@@ -216,13 +294,38 @@ async function processPendingRefunds(options = {}) {
         .find({
           refundQueue: true,
           refundStatus: { $ne: "refunded" },
+          $and: [
+            {
+              $or: [
+                { refundAttempts: { $exists: false } },
+                { refundAttempts: null },
+                { refundAttempts: { $lt: maxRetries } },
+              ],
+            },
+            {
+              $or: [
+                { nextRetryAt: { $exists: false } },
+                { nextRetryAt: null },
+                { nextRetryAt: { $lte: now } },
+              ],
+            },
+            {
+              $or: [
+                { refundStatus: { $exists: false } },
+                { refundStatus: null },
+                { refundStatus: { $ne: "failed_max_retries" } },
+              ],
+            },
+          ],
         })
         .limit(maxBatch)
         .toArray();
 
       for (const payment of candidatePayments) {
         if (payment.refundStatus === "refunded") continue;
+        if (payment.refundStatus === "failed_max_retries") continue;
         if ((payment.refundAttempts || 0) >= maxRetries) continue;
+        if (payment.nextRetryAt && new Date(payment.nextRetryAt) > now) continue;
 
         // Atomic claim
         const claimRes = await paymentsCollection.updateOne(
@@ -247,10 +350,17 @@ async function processPendingRefunds(options = {}) {
 
         const paymentIntentId = payment.transactionId;
         if (!paymentIntentId || !paymentIntentId.startsWith("pi_")) {
+          const currentAttempts = (payment.refundAttempts || 0) + 1;
+          const isMax = currentAttempts >= maxRetries;
           await paymentsCollection.updateOne(
             { _id: payment._id },
             {
-              $set: { refundError: "Missing valid PaymentIntent ID", updatedAt: new Date() },
+              $set: {
+                refundError: "Missing valid PaymentIntent ID",
+                refundStatus: isMax ? "failed_max_retries" : (payment.refundStatus || "pending_refund"),
+                refundQueue: !isMax,
+                updatedAt: new Date(),
+              },
               $unset: { refundClaimedAt: "" },
             }
           );
@@ -273,35 +383,65 @@ async function processPendingRefunds(options = {}) {
           );
 
           if (refund && (refund.status === "succeeded" || refund.status === "pending")) {
-            const finalStatus = refund.status === "succeeded" ? "refunded" : "pending_refund";
+            const isSucceeded = refund.status === "succeeded";
+            const finalStatus = isSucceeded ? "refunded" : "pending_refund";
+            const nowTime = new Date();
+
+            const paymentUpdate = {
+              refundStatus: finalStatus,
+              refundId: refund.id,
+              refundQueue: !isSucceeded,
+              updatedAt: nowTime,
+            };
+            const paymentUnset = {
+              refundClaimedAt: "",
+              refundError: "",
+            };
+
+            if (isSucceeded) {
+              paymentUpdate.refundSuccessAt = payment.refundSuccessAt || nowTime;
+              paymentUnset.nextRetryAt = "";
+            } else {
+              // Pending refund: NEVER set refundSuccessAt
+              const currentAttempts = (payment.refundAttempts || 0) + 1;
+              const delayMs = calculateBackoffDelay(currentAttempts, baseDelayMs);
+              paymentUpdate.nextRetryAt = new Date(nowTime.getTime() + delayMs);
+            }
+
             await paymentsCollection.updateOne(
               { _id: payment._id },
               {
-                $set: {
-                  refundStatus: finalStatus,
-                  refundId: refund.id,
-                  refundQueue: finalStatus !== "refunded",
-                  refundSuccessAt: new Date(),
-                  updatedAt: new Date(),
-                },
-                $unset: { refundClaimedAt: "", refundError: "" },
+                $set: paymentUpdate,
+                $unset: paymentUnset,
               }
             );
-            if (finalStatus === "refunded") refundedCount++;
+            if (isSucceeded) refundedCount++;
           }
         } catch (err) {
           const attempts = (payment.refundAttempts || 0) + 1;
           const isMaxRetries = attempts >= maxRetries;
+          const delayMs = calculateBackoffDelay(attempts, baseDelayMs);
+          const nextRetryAt = new Date(now.getTime() + delayMs);
+
+          const errUpdate = {
+            refundError: err.message || String(err),
+            refundStatus: isMaxRetries ? "failed_max_retries" : "pending_refund",
+            refundQueue: !isMaxRetries,
+            updatedAt: new Date(),
+          };
+          const errUnset = { refundClaimedAt: "" };
+
+          if (!isMaxRetries) {
+            errUpdate.nextRetryAt = nextRetryAt;
+          } else {
+            errUnset.nextRetryAt = "";
+          }
+
           await paymentsCollection.updateOne(
             { _id: payment._id },
             {
-              $set: {
-                refundError: err.message || String(err),
-                refundStatus: isMaxRetries ? "failed_max_retries" : "pending_refund",
-                refundQueue: !isMaxRetries,
-                updatedAt: new Date(),
-              },
-              $unset: { refundClaimedAt: "" },
+              $set: errUpdate,
+              $unset: errUnset,
             }
           );
           failedCount++;
@@ -360,4 +500,5 @@ module.exports = {
   startRefundRecoveryWorker,
   stopRefundRecoveryWorker,
   getRefundIdempotencyKey,
+  calculateBackoffDelay,
 };

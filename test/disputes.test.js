@@ -884,4 +884,237 @@ describe("Dispute Workflow API Suite (Phase 5)", () => {
       setStripeInstance(null);
     });
   });
+
+  // ──────────────────────────────────────────
+  // 6. Concurrency & Duplicate Prevention Suite
+  // ──────────────────────────────────────────
+  describe("6. Concurrency & Duplicate Prevention Suite", () => {
+    it("two simultaneous dispute requests for one order: exactly one succeeds (201) and one gets 409", async () => {
+      const concurrentOrderId = new ObjectId().toString();
+      await mockOrders.insertOne({
+        _id: new ObjectId(concurrentOrderId),
+        buyerInfo: buyerEmail,
+        buyerName: "Concurrent Buyer",
+        sellerInfo: sellerEmail,
+        productTitle: "Concurrent Item",
+        price: 500,
+        paymentStatus: "paid",
+        orderStatus: "delivered",
+        createdAt: new Date(),
+      });
+
+      const payload = {
+        reason: "Item defect discovered",
+        details: "Screen is flickering on concurrent test",
+      };
+
+      const [res1, res2] = await Promise.all([
+        fetch(`${baseUrl}/api/orders/${concurrentOrderId}/dispute`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${buyerToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        }),
+        fetch(`${baseUrl}/api/orders/${concurrentOrderId}/dispute`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${buyerToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        }),
+      ]);
+
+      const statuses = [res1.status, res2.status].sort();
+      assert.deepStrictEqual(
+        statuses,
+        [201, 409],
+        "One request must succeed with 201 Created and the concurrent request must receive 409 Conflict"
+      );
+
+      // Verify disputes collection contains exactly one dispute for this order
+      const disputesCount = await mockDisputes.countDocuments({
+        $or: [{ orderId: concurrentOrderId }, { orderObjectId: new ObjectId(concurrentOrderId) }],
+      });
+      assert.strictEqual(disputesCount, 1, "Exactly one dispute record must be stored");
+    });
+
+    it("multiple (5) simultaneous dispute requests: exactly one succeeds and 4 receive 409 Conflict", async () => {
+      const multiOrderId = new ObjectId().toString();
+      await mockOrders.insertOne({
+        _id: new ObjectId(multiOrderId),
+        buyerInfo: buyerEmail,
+        buyerName: "Multi Buyer",
+        sellerInfo: sellerEmail,
+        productTitle: "Multi Concurrency Item",
+        price: 750,
+        paymentStatus: "paid",
+        orderStatus: "delivered",
+        createdAt: new Date(),
+      });
+
+      const payload = {
+        reason: "Package damaged",
+        details: "Multiple concurrent submission attempt",
+      };
+
+      const promises = Array.from({ length: 5 }, () =>
+        fetch(`${baseUrl}/api/orders/${multiOrderId}/dispute`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${buyerToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        })
+      );
+
+      const responses = await Promise.all(promises);
+      const statuses = responses.map((r) => r.status);
+      const count201 = statuses.filter((s) => s === 201).length;
+      const count409 = statuses.filter((s) => s === 409).length;
+
+      assert.strictEqual(count201, 1, "Exactly 1 request out of 5 must receive 201 Created");
+      assert.strictEqual(count409, 4, "Remaining 4 concurrent requests must receive 409 Conflict");
+
+      const storedDisputes = await mockDisputes.countDocuments({
+        $or: [{ orderId: multiOrderId }, { orderObjectId: new ObjectId(multiOrderId) }],
+      });
+      assert.strictEqual(storedDisputes, 1);
+    });
+
+    it("gracefully catches and handles MongoDB duplicate key error (code 11000) returning 409", async () => {
+      const e11000OrderId = new ObjectId().toString();
+      await mockOrders.insertOne({
+        _id: new ObjectId(e11000OrderId),
+        buyerInfo: buyerEmail,
+        sellerInfo: sellerEmail,
+        productTitle: "E11000 Test Item",
+        price: 300,
+        paymentStatus: "paid",
+        orderStatus: "delivered",
+        createdAt: new Date(),
+      });
+
+      // Simulate a scenario where disputesCollection throws code 11000
+      const originalInsertOne = mockDisputes.insertOne;
+      let insertAttempted = false;
+      mockDisputes.insertOne = async function (doc) {
+        if (doc.orderId === e11000OrderId) {
+          insertAttempted = true;
+          const dupErr = new Error(
+            "E11000 duplicate key error collection: resell_hub.disputes index: orderId_1 dup key: { orderId: \"" +
+              e11000OrderId +
+              "\" }"
+          );
+          dupErr.code = 11000;
+          throw dupErr;
+        }
+        return originalInsertOne.call(this, doc);
+      };
+
+      try {
+        const res = await fetch(`${baseUrl}/api/orders/${e11000OrderId}/dispute`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${buyerToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ reason: "Item broken", details: "E11000 simulation" }),
+        });
+
+        assert.strictEqual(res.status, 409, "Must return 409 Conflict on duplicate key error");
+        const body = await res.json();
+        assert.match(body.message, /already been submitted/i);
+        assert.ok(insertAttempted, "Insert should have been attempted and caught");
+      } finally {
+        mockDisputes.insertOne = originalInsertOne;
+      }
+    });
+
+    it("rejects dispute submission if another buyer attempts to dispute someone else's order (403)", async () => {
+      const foreignOrderId = new ObjectId().toString();
+      await mockOrders.insertOne({
+        _id: new ObjectId(foreignOrderId),
+        buyerInfo: buyerEmail,
+        sellerInfo: sellerEmail,
+        productTitle: "Buyer 1 Order",
+        price: 120,
+        paymentStatus: "paid",
+        orderStatus: "delivered",
+        createdAt: new Date(),
+      });
+
+      // buyer2 attempts to dispute buyer1's order
+      const res = await fetch(`${baseUrl}/api/orders/${foreignOrderId}/dispute`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${buyer2Token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ reason: "Malicious attempt on foreign order" }),
+      });
+
+      assert.strictEqual(res.status, 403);
+      const data = await res.json();
+      assert.match(data.message, /only dispute your own orders/i);
+    });
+
+    it("two different orders creating disputes independently succeed concurrently with 201", async () => {
+      const orderAId = new ObjectId().toString();
+      const orderBId = new ObjectId().toString();
+
+      await mockOrders.insertOne({
+        _id: new ObjectId(orderAId),
+        buyerInfo: buyerEmail,
+        sellerInfo: sellerEmail,
+        productTitle: "Order A",
+        price: 100,
+        paymentStatus: "paid",
+        orderStatus: "delivered",
+        createdAt: new Date(),
+      });
+
+      await mockOrders.insertOne({
+        _id: new ObjectId(orderBId),
+        buyerInfo: buyerEmail,
+        sellerInfo: sellerEmail,
+        productTitle: "Order B",
+        price: 200,
+        paymentStatus: "paid",
+        orderStatus: "delivered",
+        createdAt: new Date(),
+      });
+
+      const [resA, resB] = await Promise.all([
+        fetch(`${baseUrl}/api/orders/${orderAId}/dispute`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${buyerToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ reason: "Order A issue" }),
+        }),
+        fetch(`${baseUrl}/api/orders/${orderBId}/dispute`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${buyerToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ reason: "Order B issue" }),
+        }),
+      ]);
+
+      assert.strictEqual(resA.status, 201);
+      assert.strictEqual(resB.status, 201);
+
+      const dispA = await mockDisputes.findOne({ orderId: orderAId });
+      const dispB = await mockDisputes.findOne({ orderId: orderBId });
+      assert.ok(dispA);
+      assert.ok(dispB);
+      assert.notStrictEqual(dispA._id.toString(), dispB._id.toString());
+    });
+  });
 });

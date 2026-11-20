@@ -144,7 +144,33 @@ async function createIndexes() {
   }
 
   if (collections.disputesCollection && typeof collections.disputesCollection.createIndex === "function") {
-    await safeCreateIndex(collections.disputesCollection, { orderId: 1 });
+    try {
+      await collections.disputesCollection.createIndex(
+        { orderId: 1 },
+        { unique: true, sparse: true, name: "orderId_1" }
+      );
+    } catch (err) {
+      let isUniqueEnforced = false;
+      if (typeof collections.disputesCollection.indexes === "function") {
+        try {
+          const idxs = await collections.disputesCollection.indexes();
+          const existing = idxs.find(
+            (idx) =>
+              idx.name === "orderId_1" ||
+              (idx.key && idx.key.orderId === 1 && Object.keys(idx.key).length === 1)
+          );
+          if (existing && existing.unique === true) {
+            isUniqueEnforced = true;
+          }
+        } catch (_) {}
+      }
+
+      if (!isUniqueEnforced) {
+        console.warn(
+          `[INDEX NOTICE] Unique constraint on 'disputes.orderId' not yet active: ${err.message}. Atomic order-level locking guarantees concurrency protection. Run 'npm run migrate:dispute-index' to safely migrate the index without data loss.`
+        );
+      }
+    }
     await safeCreateIndex(collections.disputesCollection, { buyerEmail: 1 });
     await safeCreateIndex(collections.disputesCollection, { status: 1 });
     await safeCreateIndex(collections.disputesCollection, { createdAt: -1 });

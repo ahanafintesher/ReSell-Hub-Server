@@ -587,21 +587,50 @@ router.patch(
                 refund &&
                 (refund.status === "succeeded" || refund.status === "pending")
               ) {
+                const isSucceeded = refund.status === "succeeded";
                 const finalStatus =
-                  refund.status === "succeeded" ? "refunded" : "pending_refund";
+                  isSucceeded ? "refunded" : "pending_refund";
+                const nowTime = new Date();
+                const orderUpdate = {
+                  refundStatus: finalStatus,
+                  refundId: refund.id,
+                  refundQueue: !isSucceeded,
+                  updatedAt: nowTime,
+                };
+                if (isSucceeded) {
+                  orderUpdate.refundSuccessAt = nowTime;
+                }
                 await ordersCollection.updateOne(
                   { _id: new ObjectId(orderId) },
                   {
-                    $set: {
-                      refundStatus: finalStatus,
-                      refundId: refund.id,
-                      refundQueue: finalStatus !== "refunded",
-                      refundSuccessAt: new Date(),
-                      updatedAt: new Date(),
-                    },
+                    $set: orderUpdate,
                     $unset: { refundError: "" },
                   }
                 );
+
+                if (paymentsCollection) {
+                  const paymentUpdate = {
+                    refundStatus: finalStatus,
+                    refundId: refund.id,
+                    refundQueue: !isSucceeded,
+                    updatedAt: nowTime,
+                  };
+                  if (isSucceeded) {
+                    paymentUpdate.refundSuccessAt = nowTime;
+                  }
+                  await paymentsCollection.updateOne(
+                    {
+                      $or: [
+                        { orderId: new ObjectId(orderId) },
+                        { session_id: order.paymentId },
+                      ],
+                    },
+                    {
+                      $set: paymentUpdate,
+                      $unset: { refundError: "" },
+                    }
+                  );
+                }
               }
             }
           } catch (rErr) {
@@ -747,6 +776,34 @@ router.post(
       }
 
       const now = new Date();
+
+      // Atomic concurrency lock on the order document: ensures that two concurrent requests
+      // cannot both proceed to insert disputes for the same order.
+      const orderClaim = await ordersCollection.updateOne(
+        {
+          _id: new ObjectId(id),
+          isDisputed: { $ne: true },
+        },
+        {
+          $set: {
+            isDisputed: true,
+            disputeStatus: "opening",
+            disputeClaimedAt: now,
+          },
+        }
+      );
+
+      if (!orderClaim || orderClaim.matchedCount === 0) {
+        // Concurrently claimed by another request or dispute already exists
+        const currentDispute = await disputesCollection.findOne({
+          $or: [{ orderId: id }, { orderObjectId: new ObjectId(id) }],
+        });
+        return res.status(409).json({
+          message: "A dispute has already been submitted for this order",
+          disputeId: currentDispute ? currentDispute._id : (order.disputeId || undefined),
+        });
+      }
+
       const disputeDoc = {
         orderId: id,
         orderObjectId: new ObjectId(id),
@@ -765,7 +822,30 @@ router.post(
         updatedAt: now,
       };
 
-      const insertResult = await disputesCollection.insertOne(disputeDoc);
+      let insertResult;
+      try {
+        insertResult = await disputesCollection.insertOne(disputeDoc);
+      } catch (insertErr) {
+        // Handle MongoDB unique constraint violation (duplicate key error code 11000)
+        if (
+          insertErr.code === 11000 ||
+          (insertErr.message && insertErr.message.includes("E11000"))
+        ) {
+          const conflictDispute = await disputesCollection.findOne({
+            $or: [{ orderId: id }, { orderObjectId: new ObjectId(id) }],
+          });
+          return res.status(409).json({
+            message: "A dispute has already been submitted for this order",
+            disputeId: conflictDispute ? conflictDispute._id : undefined,
+          });
+        }
+        // Rollback the atomic claim on unexpected non-duplicate insertion failure
+        await ordersCollection.updateOne(
+          { _id: new ObjectId(id), disputeStatus: "opening" },
+          { $unset: { isDisputed: "", disputeStatus: "", disputeClaimedAt: "" } }
+        );
+        throw insertErr;
+      }
 
       await ordersCollection.updateOne(
         { _id: new ObjectId(id) },
@@ -776,6 +856,7 @@ router.post(
             disputeStatus: "opened",
             updatedAt: now,
           },
+          $unset: { disputeClaimedAt: "" },
         }
       );
 

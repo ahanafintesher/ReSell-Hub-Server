@@ -16,6 +16,7 @@ const {
 const {
   processPendingRefunds,
   getRefundIdempotencyKey,
+  calculateBackoffDelay,
 } = require("../src/utils/refundRecovery");
 
 /**
@@ -295,6 +296,13 @@ describe("Reliability & Concurrency Regression Test Suite", () => {
   });
 
   beforeEach(() => {
+    setCollections({
+      usersCollection: mockUsers,
+      productsCollection: mockProducts,
+      ordersCollection: mockOrders,
+      paymentsCollection: mockPayments,
+      processedEventsCollection: mockProcessedEvents,
+    });
     mockUsers.reset([
       {
         _id: new ObjectId("60c72b2f9b1d8b2bad000001"),
@@ -966,6 +974,389 @@ describe("Reliability & Concurrency Regression Test Suite", () => {
       const res2 = await run();
       assert.ok(res1);
       assert.strictEqual(res1, res2);
+    });
+  });
+
+  // ──────────────────────────────────────────
+  // 12. Financial State & Refund Timestamp Consistency (Rule 8 Integrity)
+  // ──────────────────────────────────────────
+  describe("12. Financial State & Refund Timestamp Consistency (Rule 8 Integrity)", () => {
+    it("does NOT set refundSuccessAt when Stripe returns pending on recovery", async () => {
+      const orderId = new ObjectId();
+      mockOrders.reset([
+        {
+          _id: orderId,
+          paymentStatus: "paid",
+          orderStatus: "cancelled",
+          transactionId: "pi_pending_recovery_1",
+          refundStatus: "pending_refund",
+          refundQueue: true,
+          refundAttempts: 0,
+        },
+      ]);
+      mockPayments.reset([
+        {
+          _id: new ObjectId(),
+          orderId,
+          transactionId: "pi_pending_recovery_1",
+          paymentStatus: "paid",
+          refundStatus: "pending_refund",
+          refundQueue: true,
+        },
+      ]);
+
+      const originalCreate = mockStripe.refunds.create;
+      mockStripe.refunds.create = async (params, options) => {
+        return {
+          id: "re_pending_test_1",
+          status: "pending",
+          payment_intent: params.payment_intent,
+        };
+      };
+
+      try {
+        const result = await processPendingRefunds({ maxBatch: 5, maxRetries: 3 });
+        assert.strictEqual(result.refunded, 0, "Pending refund must not increment refundedCount");
+
+        const updatedOrder = await mockOrders.findOne({ _id: orderId });
+        assert.strictEqual(updatedOrder.refundStatus, "pending_refund");
+        assert.strictEqual(updatedOrder.refundQueue, true);
+        assert.strictEqual(
+          updatedOrder.refundSuccessAt,
+          undefined,
+          "refundSuccessAt must NEVER be set on pending refund"
+        );
+        assert.ok(updatedOrder.nextRetryAt instanceof Date, "nextRetryAt must be scheduled");
+
+        const updatedPayment = await mockPayments.findOne({ orderId });
+        assert.strictEqual(updatedPayment.refundStatus, "pending_refund");
+        assert.strictEqual(
+          updatedPayment.refundSuccessAt,
+          undefined,
+          "refundSuccessAt must not be set on payment for pending refund"
+        );
+      } finally {
+        mockStripe.refunds.create = originalCreate;
+      }
+    });
+
+    it("sets valid refundSuccessAt when Stripe confirms succeeded on recovery", async () => {
+      const orderId = new ObjectId();
+      mockOrders.reset([
+        {
+          _id: orderId,
+          paymentStatus: "paid",
+          orderStatus: "cancelled",
+          transactionId: "pi_succeeded_recovery_1",
+          refundStatus: "pending_refund",
+          refundQueue: true,
+          refundAttempts: 0,
+        },
+      ]);
+      mockPayments.reset([
+        {
+          _id: new ObjectId(),
+          orderId,
+          transactionId: "pi_succeeded_recovery_1",
+          paymentStatus: "paid",
+          refundStatus: "pending_refund",
+          refundQueue: true,
+        },
+      ]);
+
+      const originalCreate = mockStripe.refunds.create;
+      mockStripe.refunds.create = async (params, options) => {
+        return {
+          id: "re_succeeded_test_1",
+          status: "succeeded",
+          payment_intent: params.payment_intent,
+        };
+      };
+
+      try {
+        const result = await processPendingRefunds({ maxBatch: 5, maxRetries: 3 });
+        assert.strictEqual(result.refunded, 1);
+
+        const updatedOrder = await mockOrders.findOne({ _id: orderId });
+        assert.strictEqual(updatedOrder.refundStatus, "refunded");
+        assert.strictEqual(updatedOrder.refundQueue, false);
+        assert.ok(
+          updatedOrder.refundSuccessAt instanceof Date,
+          "refundSuccessAt must be set to Date upon confirmed succeeded refund"
+        );
+
+        const updatedPayment = await mockPayments.findOne({ orderId });
+        assert.strictEqual(updatedPayment.refundStatus, "refunded");
+        assert.ok(
+          updatedPayment.refundSuccessAt instanceof Date,
+          "Payment refundSuccessAt must be synchronized"
+        );
+      } finally {
+        mockStripe.refunds.create = originalCreate;
+      }
+    });
+
+    it("does NOT set refundSuccessAt when Stripe throws error on recovery", async () => {
+      const orderId = new ObjectId();
+      mockOrders.reset([
+        {
+          _id: orderId,
+          paymentStatus: "paid",
+          orderStatus: "cancelled",
+          transactionId: "pi_error_recovery_1",
+          refundStatus: "pending_refund",
+          refundQueue: true,
+          refundAttempts: 0,
+        },
+      ]);
+
+      const originalCreate = mockStripe.refunds.create;
+      mockStripe.refunds.create = async () => {
+        throw new Error("Stripe network error on refund attempt");
+      };
+
+      try {
+        const result = await processPendingRefunds({ maxBatch: 5, maxRetries: 3 });
+        assert.strictEqual(result.failed, 1);
+
+        const updatedOrder = await mockOrders.findOne({ _id: orderId });
+        assert.strictEqual(updatedOrder.refundStatus, "pending_refund");
+        assert.strictEqual(
+          updatedOrder.refundSuccessAt,
+          undefined,
+          "refundSuccessAt must not be set on failed refund"
+        );
+        assert.ok(updatedOrder.refundError);
+        assert.ok(updatedOrder.nextRetryAt instanceof Date);
+      } finally {
+        mockStripe.refunds.create = originalCreate;
+      }
+    });
+
+    it("cancellation immediate refund: pending Stripe status does not set refundSuccessAt and synchronizes payment", async () => {
+      const orderId = new ObjectId();
+      const sessionId = "cs_cancel_pending_sync_1";
+      const piId = "pi_cancel_pending_sync_1";
+
+      mockOrders.reset([
+        {
+          _id: orderId,
+          buyerInfo: "buyer1@example.com",
+          paymentStatus: "paid",
+          orderStatus: "pending",
+          transactionId: piId,
+          paymentId: sessionId,
+          createdAt: new Date(),
+        },
+      ]);
+      mockPayments.reset([
+        {
+          _id: new ObjectId(),
+          orderId,
+          session_id: sessionId,
+          transactionId: piId,
+          paymentStatus: "paid",
+        },
+      ]);
+
+      const originalCreate = mockStripe.refunds.create;
+      mockStripe.refunds.create = async () => {
+        return { id: "re_pending_cancel_1", status: "pending" };
+      };
+
+      try {
+        const res = await fetch(`${baseUrl}/api/orders/${orderId}/cancel`, {
+          method: "PATCH",
+          headers: {
+            Authorization: `Bearer ${buyer1Token}`,
+            "Content-Type": "application/json",
+          },
+        });
+
+        assert.strictEqual(res.status, 200);
+
+        const order = await mockOrders.findOne({ _id: orderId });
+        assert.strictEqual(order.refundStatus, "pending_refund");
+        assert.strictEqual(order.refundSuccessAt, undefined);
+
+        const payment = await mockPayments.findOne({ orderId });
+        assert.strictEqual(payment.refundStatus, "pending_refund");
+        assert.strictEqual(payment.refundSuccessAt, undefined);
+      } finally {
+        mockStripe.refunds.create = originalCreate;
+      }
+    });
+
+    it("cancellation immediate refund: succeeded Stripe status sets refundSuccessAt and synchronizes payment", async () => {
+      const orderId = new ObjectId();
+      const sessionId = "cs_cancel_succeeded_sync_1";
+      const piId = "pi_cancel_succeeded_sync_1";
+
+      mockOrders.reset([
+        {
+          _id: orderId,
+          buyerInfo: "buyer1@example.com",
+          paymentStatus: "paid",
+          orderStatus: "pending",
+          transactionId: piId,
+          paymentId: sessionId,
+          createdAt: new Date(),
+        },
+      ]);
+      mockPayments.reset([
+        {
+          _id: new ObjectId(),
+          orderId,
+          session_id: sessionId,
+          transactionId: piId,
+          paymentStatus: "paid",
+        },
+      ]);
+
+      const originalCreate = mockStripe.refunds.create;
+      mockStripe.refunds.create = async () => {
+        return { id: "re_succeeded_cancel_1", status: "succeeded" };
+      };
+
+      try {
+        const res = await fetch(`${baseUrl}/api/orders/${orderId}/cancel`, {
+          method: "PATCH",
+          headers: {
+            Authorization: `Bearer ${buyer1Token}`,
+            "Content-Type": "application/json",
+          },
+        });
+
+        assert.strictEqual(res.status, 200);
+
+        const order = await mockOrders.findOne({ _id: orderId });
+        assert.strictEqual(order.refundStatus, "refunded");
+        assert.ok(order.refundSuccessAt instanceof Date);
+
+        const payment = await mockPayments.findOne({ orderId });
+        assert.strictEqual(payment.refundStatus, "refunded");
+        assert.ok(payment.refundSuccessAt instanceof Date);
+      } finally {
+        mockStripe.refunds.create = originalCreate;
+      }
+    });
+
+    it("charge.refunded webhook: sets refundSuccessAt on order and payment when succeeded, but not when pending", async () => {
+      const piSuccess = "pi_wh_test_succ_1";
+      const orderSuccessId = new ObjectId();
+      mockOrders.reset([
+        {
+          _id: orderSuccessId,
+          transactionId: piSuccess,
+          paymentStatus: "paid",
+          refundStatus: "pending_refund",
+        },
+      ]);
+      mockPayments.reset([
+        {
+          _id: new ObjectId(),
+          orderId: orderSuccessId,
+          transactionId: piSuccess,
+          paymentStatus: "paid",
+          refundStatus: "pending_refund",
+        },
+      ]);
+
+      const succPayload = {
+        id: "evt_charge_refunded_succ_1",
+        type: "charge.refunded",
+        data: {
+          object: {
+            id: "ch_wh_succ_1",
+            payment_intent: piSuccess,
+            refunded: true,
+            refunds: {
+              data: [{ id: "re_wh_succ_1", status: "succeeded" }],
+            },
+          },
+        },
+      };
+
+      const { rawPayload: rawSucc, signature: sigSucc } = generateSignedWebhook(succPayload);
+      const resSucc = await fetch(`${baseUrl}/api/stripe/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "stripe-signature": sigSucc,
+        },
+        body: rawSucc,
+      });
+
+      assert.strictEqual(resSucc.status, 200);
+      const updatedOrderSucc = await mockOrders.findOne({ _id: orderSuccessId });
+      assert.strictEqual(updatedOrderSucc.refundStatus, "refunded");
+      assert.ok(updatedOrderSucc.refundSuccessAt instanceof Date);
+
+      const updatedPaymentSucc = await mockPayments.findOne({ orderId: orderSuccessId });
+      assert.strictEqual(updatedPaymentSucc.refundStatus, "refunded");
+      assert.ok(updatedPaymentSucc.refundSuccessAt instanceof Date);
+    });
+  });
+
+  // ──────────────────────────────────────────
+  // 13. Starvation Prevention and Bounded Exponential Backoff Scheduling
+  // ──────────────────────────────────────────
+  describe("13. Starvation Prevention and Bounded Exponential Backoff Scheduling", () => {
+    it("calculateBackoffDelay calculates bounded exponential backoff correctly", () => {
+      assert.strictEqual(calculateBackoffDelay(1, 30000, 3600000), 30000); // 30s
+      assert.strictEqual(calculateBackoffDelay(2, 30000, 3600000), 60000); // 60s
+      assert.strictEqual(calculateBackoffDelay(3, 30000, 3600000), 120000); // 120s
+      assert.strictEqual(calculateBackoffDelay(4, 30000, 3600000), 240000); // 240s
+      assert.strictEqual(calculateBackoffDelay(10, 30000, 3600000), 3600000); // capped at 1h
+    });
+
+    it("starvation prevention: candidate orders query excludes exhausted records (refundAttempts >= maxRetries)", async () => {
+      const activeOrderId = new ObjectId();
+      mockOrders.reset([
+        {
+          _id: new ObjectId(),
+          paymentStatus: "paid",
+          orderStatus: "cancelled",
+          transactionId: "pi_exhausted_1",
+          refundStatus: "pending_refund",
+          refundQueue: true,
+          refundAttempts: 3, // exhausted
+        },
+        {
+          _id: new ObjectId(),
+          paymentStatus: "paid",
+          orderStatus: "cancelled",
+          transactionId: "pi_exhausted_2",
+          refundStatus: "pending_refund",
+          refundQueue: true,
+          refundAttempts: 3, // exhausted
+        },
+        {
+          _id: new ObjectId(),
+          paymentStatus: "paid",
+          orderStatus: "cancelled",
+          transactionId: "pi_exhausted_3",
+          refundStatus: "pending_refund",
+          refundQueue: true,
+          refundAttempts: 3, // exhausted
+        },
+        {
+          _id: activeOrderId,
+          paymentStatus: "paid",
+          orderStatus: "cancelled",
+          transactionId: "pi_active_fresh_1",
+          refundStatus: "pending_refund",
+          refundQueue: true,
+          refundAttempts: 0, // fresh eligible record
+        },
+      ]);
+
+      // Batch limit of 2: if exhausted records were not excluded by query, they would fill the batch and starve activeOrderId
+      const result = await processPendingRefunds({ maxBatch: 2, maxRetries: 3 });
+      assert.strictEqual(result.refunded, 1, "Eligible record must be processed and refunded without starvation");
+
+      const activeOrder = await mockOrders.findOne({ _id: activeOrderId });
+      assert.strictEqual(activeOrder.refundStatus, "refunded");
     });
   });
 });

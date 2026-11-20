@@ -5,6 +5,10 @@ const {
   migratePaymentIndex,
   checkDuplicatePaymentIds,
 } = require("../scripts/migrate-payment-index");
+const {
+  migrateDisputeIndex,
+  checkDuplicateDisputeOrderIds,
+} = require("../scripts/migrate-dispute-index");
 
 describe("MongoDB Index Initialization & Failure Handling Test Suite", () => {
   let originalCollections;
@@ -283,6 +287,150 @@ describe("MongoDB Index Initialization & Failure Handling Test Suite", () => {
       };
 
       const result = await migratePaymentIndex({ db: mockDb });
+      assert.strictEqual(result.success, true);
+      assert.match(result.message, /already configured/);
+      assert.strictEqual(droppedIndex, null);
+      assert.strictEqual(createdIndex, null);
+    });
+  });
+
+  describe("3. Dispute orderId Unique Sparse Index Migration Safety", () => {
+    it("aborts migration without deleting documents when duplicates are detected in disputes collection", async () => {
+      let dropCalled = false;
+      let createCalled = false;
+
+      const mockDb = {
+        collection() {
+          return {
+            aggregate() {
+              return {
+                toArray: async () => [
+                  {
+                    _id: "order_dup_123",
+                    count: 2,
+                    docIds: ["disp_1", "disp_2"],
+                  },
+                ],
+              };
+            },
+            async indexes() {
+              return [{ name: "orderId_1", key: { orderId: 1 } }];
+            },
+            async dropIndex() {
+              dropCalled = true;
+            },
+            async createIndex() {
+              createCalled = true;
+            },
+          };
+        },
+      };
+
+      const result = await migrateDisputeIndex({ db: mockDb });
+      assert.strictEqual(result.success, false);
+      assert.strictEqual(result.duplicateCount, 1);
+      assert.match(result.message, /MIGRATION ABORTED/);
+      assert.strictEqual(dropCalled, false, "Must never drop index when duplicates exist");
+      assert.strictEqual(createCalled, false, "Must never create index when duplicates exist");
+    });
+
+    it("respects dry-run mode and does not alter indexes on disputes", async () => {
+      let droppedIndex = null;
+      let createdIndex = null;
+
+      const mockDb = {
+        collection() {
+          return {
+            aggregate() {
+              return { toArray: async () => [] };
+            },
+            async indexes() {
+              return [{ name: "orderId_1", key: { orderId: 1 } }];
+            },
+            async dropIndex(name) {
+              droppedIndex = name;
+            },
+            async createIndex(key, opts) {
+              createdIndex = { key, opts };
+              return "orderId_1";
+            },
+          };
+        },
+      };
+
+      const result = await migrateDisputeIndex({ db: mockDb, dryRun: true });
+      assert.strictEqual(result.success, true);
+      assert.strictEqual(droppedIndex, null, "Dry run must not drop index");
+      assert.strictEqual(createdIndex, null, "Dry run must not create index");
+    });
+
+    it("safely migrates non-unique dispute index to unique sparse index when no duplicates exist", async () => {
+      let droppedIndex = null;
+      let createdIndex = null;
+      let indexState = [{ name: "orderId_1", key: { orderId: 1 } }];
+
+      const mockDb = {
+        collection() {
+          return {
+            aggregate() {
+              return { toArray: async () => [] };
+            },
+            async indexes() {
+              return indexState;
+            },
+            async dropIndex(name) {
+              droppedIndex = name;
+              indexState = indexState.filter((i) => i.name !== name);
+            },
+            async createIndex(key, opts) {
+              createdIndex = { key, opts };
+              indexState.push({ name: opts.name, key, ...opts });
+              return opts.name;
+            },
+          };
+        },
+      };
+
+      const result = await migrateDisputeIndex({ db: mockDb });
+      assert.strictEqual(result.success, true);
+      assert.strictEqual(droppedIndex, "orderId_1");
+      assert.deepStrictEqual(createdIndex.key, { orderId: 1 });
+      assert.strictEqual(createdIndex.opts.unique, true);
+      assert.strictEqual(createdIndex.opts.sparse, true);
+    });
+
+    it("is idempotent when dispute index is already unique and sparse", async () => {
+      let droppedIndex = null;
+      let createdIndex = null;
+
+      const mockDb = {
+        collection() {
+          return {
+            aggregate() {
+              return { toArray: async () => [] };
+            },
+            async indexes() {
+              return [
+                {
+                  name: "orderId_1",
+                  key: { orderId: 1 },
+                  unique: true,
+                  sparse: true,
+                },
+              ];
+            },
+            async dropIndex(name) {
+              droppedIndex = name;
+            },
+            async createIndex(key, opts) {
+              createdIndex = { key, opts };
+              return opts.name;
+            },
+          };
+        },
+      };
+
+      const result = await migrateDisputeIndex({ db: mockDb });
       assert.strictEqual(result.success, true);
       assert.match(result.message, /already configured/);
       assert.strictEqual(droppedIndex, null);

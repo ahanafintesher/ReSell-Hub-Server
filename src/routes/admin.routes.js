@@ -1062,18 +1062,20 @@ router.patch(
         if (
           effectiveResolution === "resolved_buyer" &&
           paymentsCollection &&
-          (refundId || finalRefundStatus === "refunded")
+          (refundId || finalRefundStatus === "refunded" || finalRefundStatus === "pending_refund")
         ) {
+          const paymentUpdate = {
+            refundStatus: finalRefundStatus,
+            refundId: refundId || undefined,
+            refundQueue: isRefundQueue,
+            updatedAt: now,
+          };
+          if (finalRefundStatus === "refunded" && refundSuccessAt) {
+            paymentUpdate.refundSuccessAt = refundSuccessAt;
+          }
           await paymentsCollection.updateOne(
             { $or: [{ orderId: order._id }, { session_id: order.paymentId }] },
-            {
-              $set: {
-                refundStatus: finalRefundStatus,
-                refundId: refundId || undefined,
-                refundQueue: isRefundQueue,
-                updatedAt: now,
-              },
-            }
+            { $set: paymentUpdate }
           );
         }
       }
