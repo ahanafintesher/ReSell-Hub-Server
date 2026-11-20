@@ -3,7 +3,8 @@ const { ObjectId } = require("mongodb");
 const { getCollections } = require("../config/db");
 const { verifyToken, requireRole } = require("../middleware/auth");
 const { escapeRegex } = require("../utils/helpers");
-const { processPendingRefunds } = require("../utils/refundRecovery");
+const { getStripeInstance } = require("../config/stripe");
+const { processPendingRefunds, getRefundIdempotencyKey } = require("../utils/refundRecovery");
 
 const router = express.Router();
 
@@ -754,6 +755,340 @@ router.post(
     } catch (error) {
       console.error("Admin refund queue processing error:", error.message || error);
       res.status(500).json({ message: "Failed to process refund recovery queue" });
+    }
+  }
+);
+
+// ──────────────────────────────────────────
+// N. ADMIN DISPUTE MANAGEMENT & RESOLUTION
+// ──────────────────────────────────────────
+
+/**
+ * GET /api/admin/disputes
+ * Lists all customer disputes with status filtering, search, and pagination.
+ */
+router.get(
+  "/api/admin/disputes",
+  verifyToken,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { disputesCollection } = getCollections();
+      if (!disputesCollection) {
+        return res
+          .status(503)
+          .json({ message: "Service Unavailable: Database not connected" });
+      }
+
+      const query = {};
+      const statusParam = req.query.status && typeof req.query.status === "string" ? req.query.status.trim() : null;
+      let statusFilterCondition = null;
+
+      if (statusParam && statusParam !== "all") {
+        if (statusParam === "resolved") {
+          statusFilterCondition = {
+            $or: [
+              { status: "resolved" },
+              { status: "resolved_buyer" },
+              { status: "resolved_seller" },
+            ],
+          };
+        } else if (statusParam === "resolved_buyer") {
+          statusFilterCondition = {
+            $or: [
+              { status: "resolved_buyer" },
+              { status: "resolved", resolution: "resolved_buyer" },
+            ],
+          };
+        } else if (statusParam === "resolved_seller") {
+          statusFilterCondition = {
+            $or: [
+              { status: "resolved_seller" },
+              { status: "resolved", resolution: "resolved_seller" },
+            ],
+          };
+        } else if (statusParam === "opened") {
+          statusFilterCondition = { status: { $in: ["opened", "pending"] } };
+        } else {
+          statusFilterCondition = { status: statusParam };
+        }
+      }
+
+      let searchCondition = null;
+      if (req.query.search && typeof req.query.search === "string" && req.query.search.trim()) {
+        const regex = new RegExp(escapeRegex(req.query.search.trim()), "i");
+        searchCondition = {
+          $or: [
+            { productTitle: regex },
+            { buyerEmail: regex },
+            { sellerEmail: regex },
+            { orderId: regex },
+            { reason: regex },
+          ],
+        };
+      }
+
+      if (statusFilterCondition && searchCondition) {
+        query.$and = [statusFilterCondition, searchCondition];
+      } else if (statusFilterCondition) {
+        Object.assign(query, statusFilterCondition);
+      } else if (searchCondition) {
+        Object.assign(query, searchCondition);
+      }
+
+      const total = await countDocs(disputesCollection, query);
+      const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 10));
+      const skip = (page - 1) * limit;
+
+      let cursor = disputesCollection.find(query).sort({ createdAt: -1 });
+      if (typeof cursor.skip === "function") cursor = cursor.skip(skip);
+      if (typeof cursor.limit === "function") cursor = cursor.limit(limit);
+
+      const disputes = await cursor.toArray();
+
+      res.status(200).json({
+        disputes,
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit) || 1,
+      });
+    } catch (error) {
+      console.error("Admin disputes fetch error:", error.message || error);
+      res.status(500).json({ message: "Failed to fetch disputes" });
+    }
+  }
+);
+
+/**
+ * PATCH /api/admin/disputes/:id/resolve
+ * Resolves a customer dispute with an authoritative decision and notes.
+ */
+router.patch(
+  "/api/admin/disputes/:id/resolve",
+  verifyToken,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid dispute ID format" });
+      }
+
+      const { resolution, resolutionNotes, decisionNotes, decision } = req.body || {};
+      const effectiveResolution = resolution || decision;
+      const allowedResolutions = [
+        "resolved_buyer",
+        "resolved_seller",
+        "dismissed",
+        "resolved",
+      ];
+
+      if (!effectiveResolution || !allowedResolutions.includes(effectiveResolution)) {
+        return res.status(400).json({
+          message: `Invalid resolution. Must be one of: [${allowedResolutions.join(", ")}]`,
+        });
+      }
+
+      const { disputesCollection, ordersCollection, paymentsCollection } = getCollections();
+      if (!disputesCollection || !ordersCollection) {
+        return res
+          .status(503)
+          .json({ message: "Service Unavailable: Database not connected" });
+      }
+
+      const dispute = await disputesCollection.findOne({ _id: new ObjectId(id) });
+      if (!dispute) {
+        return res.status(404).json({ message: "Dispute not found" });
+      }
+
+      const terminalStatuses = [
+        "resolved",
+        "resolved_buyer",
+        "resolved_seller",
+        "dismissed",
+      ];
+      if (terminalStatuses.includes(dispute.status) || dispute.status !== "opened") {
+        return res
+          .status(400)
+          .json({ message: "Dispute has already been resolved" });
+      }
+
+      let nextStatus;
+      if (effectiveResolution === "resolved_buyer") {
+        nextStatus = "resolved_buyer";
+      } else if (effectiveResolution === "resolved_seller") {
+        nextStatus = "resolved_seller";
+      } else if (effectiveResolution === "dismissed") {
+        nextStatus = "dismissed";
+      } else {
+        nextStatus = "resolved";
+      }
+
+      const notes = typeof resolutionNotes === "string" ? resolutionNotes.trim() : (typeof decisionNotes === "string" ? decisionNotes.trim() : "");
+      const now = new Date();
+
+      // Look up related order
+      let order = null;
+      let orderQuery = null;
+      if (dispute.orderId) {
+        orderQuery = ObjectId.isValid(dispute.orderId)
+          ? { _id: new ObjectId(dispute.orderId) }
+          : { _id: dispute.orderId };
+        order = await ordersCollection.findOne(orderQuery);
+      }
+
+      let finalRefundStatus = undefined;
+      let refundId = undefined;
+      let isRefundQueue = false;
+      let refundSuccessAt = undefined;
+      let refundError = undefined;
+
+      // Handle financial resolution when adjudicated in favor of buyer
+      if (effectiveResolution === "resolved_buyer") {
+        if (order && order.paymentStatus === "paid") {
+          // Never label as "refunded" unless confirmed by Stripe
+          finalRefundStatus = "pending_refund";
+          isRefundQueue = true;
+
+          // Attempt immediate deterministic refund via Stripe if PaymentIntent is available
+          let paymentIntentId =
+            (order.transactionId && order.transactionId.startsWith("pi_") ? order.transactionId : null) ||
+            (order.paymentId && order.paymentId.startsWith("pi_") ? order.paymentId : null);
+
+          if (!paymentIntentId && paymentsCollection && order.paymentId) {
+            const paymentDoc = await paymentsCollection.findOne({
+              $or: [
+                { session_id: order.paymentId },
+                { transactionId: order.paymentId },
+              ],
+            });
+            if (
+              paymentDoc &&
+              paymentDoc.transactionId &&
+              paymentDoc.transactionId.startsWith("pi_")
+            ) {
+              paymentIntentId = paymentDoc.transactionId;
+            }
+          }
+
+          if (paymentIntentId) {
+            const stripe = getStripeInstance();
+            const idempotencyKey = getRefundIdempotencyKey(
+              order._id || id,
+              "dispute_refund"
+            );
+            try {
+              if (
+                stripe &&
+                stripe.refunds &&
+                typeof stripe.refunds.create === "function"
+              ) {
+                const refund = await stripe.refunds.create(
+                  {
+                    payment_intent: paymentIntentId,
+                    reason: "requested_by_customer",
+                  },
+                  { idempotencyKey }
+                );
+
+                if (
+                  refund &&
+                  (refund.status === "succeeded" || refund.status === "pending")
+                ) {
+                  // Only label as "refunded" when confirmed by Stripe with succeeded status
+                  finalRefundStatus =
+                    refund.status === "succeeded" ? "refunded" : "pending_refund";
+                  refundId = refund.id;
+                  isRefundQueue = finalRefundStatus !== "refunded";
+                  if (finalRefundStatus === "refunded") {
+                    refundSuccessAt = new Date();
+                  }
+                }
+              }
+            } catch (rErr) {
+              console.error(
+                "Immediate Stripe refund error on dispute resolution:",
+                rErr.message || rErr
+              );
+              refundError = rErr.message || String(rErr);
+              isRefundQueue = true;
+            }
+          }
+        } else if (order) {
+          finalRefundStatus = "not_applicable";
+          isRefundQueue = false;
+        }
+      }
+
+      // Update dispute record
+      const disputeUpdate = {
+        status: nextStatus,
+        resolution: effectiveResolution,
+        resolutionNotes: notes,
+        resolvedBy: req.user.email,
+        resolvedAt: now,
+        updatedAt: now,
+      };
+      if (effectiveResolution === "resolved_buyer") {
+        disputeUpdate.refundStatus = finalRefundStatus;
+        if (refundId) disputeUpdate.refundId = refundId;
+      }
+
+      await disputesCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: disputeUpdate }
+      );
+
+      // Keep related order synchronized
+      if (orderQuery) {
+        const orderUpdate = {
+          disputeStatus: nextStatus,
+          disputeResolution: effectiveResolution,
+          updatedAt: now,
+        };
+        if (effectiveResolution === "resolved_buyer") {
+          orderUpdate.refundStatus = finalRefundStatus;
+          orderUpdate.refundQueue = isRefundQueue;
+          if (refundId) orderUpdate.refundId = refundId;
+          if (refundSuccessAt) orderUpdate.refundSuccessAt = refundSuccessAt;
+          if (refundError) orderUpdate.refundError = refundError;
+        }
+
+        await ordersCollection.updateOne(orderQuery, { $set: orderUpdate });
+
+        // Update payment collection if present and refund was applied
+        if (
+          effectiveResolution === "resolved_buyer" &&
+          paymentsCollection &&
+          (refundId || finalRefundStatus === "refunded")
+        ) {
+          await paymentsCollection.updateOne(
+            { $or: [{ orderId: order._id }, { session_id: order.paymentId }] },
+            {
+              $set: {
+                refundStatus: finalRefundStatus,
+                refundId: refundId || undefined,
+                refundQueue: isRefundQueue,
+                updatedAt: now,
+              },
+            }
+          );
+        }
+      }
+
+      res.status(200).json({
+        success: true,
+        message: `Dispute marked as ${nextStatus}`,
+        status: nextStatus,
+        resolution: effectiveResolution,
+        refundStatus: effectiveResolution === "resolved_buyer" ? finalRefundStatus : undefined,
+        refundId: refundId || undefined,
+      });
+    } catch (error) {
+      console.error("Admin resolve dispute error:", error.message || error);
+      res.status(500).json({ message: "Failed to resolve dispute" });
     }
   }
 );

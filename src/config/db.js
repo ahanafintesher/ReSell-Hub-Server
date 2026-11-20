@@ -25,6 +25,7 @@ const collections = {
   usersCollection: null,
   reportsCollection: null,
   processedEventsCollection: null,
+  disputesCollection: null,
 };
 
 function getCollections() {
@@ -50,6 +51,8 @@ function setCollections(newCollections) {
     collections.reportsCollection = newCollections.reportsCollection;
   if ("processedEventsCollection" in newCollections)
     collections.processedEventsCollection = newCollections.processedEventsCollection;
+  if ("disputesCollection" in newCollections)
+    collections.disputesCollection = newCollections.disputesCollection;
 }
 
 /**
@@ -140,6 +143,13 @@ async function createIndexes() {
     await safeCreateIndex(collections.reportsCollection, { status: 1 });
   }
 
+  if (collections.disputesCollection && typeof collections.disputesCollection.createIndex === "function") {
+    await safeCreateIndex(collections.disputesCollection, { orderId: 1 });
+    await safeCreateIndex(collections.disputesCollection, { buyerEmail: 1 });
+    await safeCreateIndex(collections.disputesCollection, { status: 1 });
+    await safeCreateIndex(collections.disputesCollection, { createdAt: -1 });
+  }
+
   if (collections.processedEventsCollection && typeof collections.processedEventsCollection.createIndex === "function") {
     try {
       await collections.processedEventsCollection.createIndex(
@@ -200,6 +210,7 @@ async function run() {
       collections.usersCollection = collections.database.collection("user");
       collections.reportsCollection = collections.database.collection("reports");
       collections.processedEventsCollection = collections.database.collection("processed_events");
+      collections.disputesCollection = collections.database.collection("disputes");
 
       await client.db("admin").command({ ping: 1 });
       console.log(

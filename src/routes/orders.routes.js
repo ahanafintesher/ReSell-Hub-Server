@@ -666,4 +666,181 @@ router.patch(
   }
 );
 
+// ──────────────────────────────────────────
+// DISPUTE API (Buyer)
+// ──────────────────────────────────────────
+
+/**
+ * POST /api/orders/:id/dispute
+ * Allows an authenticated buyer to open a dispute for their eligible order.
+ */
+router.post(
+  "/api/orders/:id/dispute",
+  verifyToken,
+  requireRole("buyer", "admin"),
+  async (req, res) => {
+    try {
+      if (!validateUserIdentity(req, res)) return;
+
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid order ID format" });
+      }
+
+      const { reason, details } = req.body || {};
+      if (!reason || typeof reason !== "string" || reason.trim().length < 3) {
+        return res.status(400).json({
+          message: "A valid dispute reason (at least 3 characters) is required",
+        });
+      }
+
+      const { ordersCollection, disputesCollection } = getCollections();
+      if (!ordersCollection || !disputesCollection) {
+        return res
+          .status(503)
+          .json({ message: "Service Unavailable: Database not connected" });
+      }
+
+      const order = await ordersCollection.findOne({ _id: new ObjectId(id) });
+      if (!order) {
+        return res.status(404).json({ message: "Order not found" });
+      }
+
+      // Order ownership check: only the buyer who placed the order (or admin) can dispute
+      const buyerEmail = extractEmail(order.buyerInfo);
+      if (req.user.role !== "admin" && buyerEmail !== req.user.email) {
+        return res.status(403).json({
+          message: "Forbidden: You can only dispute your own orders",
+        });
+      }
+
+      // Status eligibility checks
+      if (order.orderStatus === "cancelled") {
+        return res
+          .status(400)
+          .json({ message: "Cannot dispute a cancelled order" });
+      }
+
+      if (order.orderStatus === "rejected") {
+        return res
+          .status(400)
+          .json({ message: "Cannot dispute a rejected order" });
+      }
+
+      // Check for existing dispute (active or previously filed)
+      if (order.isDisputed) {
+        return res.status(409).json({
+          message: "A dispute has already been submitted for this order",
+          disputeId: order.disputeId,
+        });
+      }
+
+      const existingDispute = await disputesCollection.findOne({
+        $or: [{ orderId: id }, { orderObjectId: new ObjectId(id) }],
+      });
+
+      if (existingDispute) {
+        return res.status(409).json({
+          message: "A dispute has already been submitted for this order",
+          disputeId: existingDispute._id,
+        });
+      }
+
+      const now = new Date();
+      const disputeDoc = {
+        orderId: id,
+        orderObjectId: new ObjectId(id),
+        buyerEmail: buyerEmail || req.user.email,
+        buyerName: order.buyerName || req.user.name || "Buyer",
+        sellerEmail: extractEmail(order.sellerInfo) || "",
+        sellerName: order.sellerName || "Seller",
+        productId: order.productId ? order.productId.toString() : null,
+        productTitle: order.productTitle || "Marketplace Product",
+        orderPrice: order.price != null ? Number(order.price) : 0,
+        paymentId: order.paymentId || null,
+        reason: reason.trim(),
+        details: typeof details === "string" ? details.trim() : "",
+        status: "opened",
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      const insertResult = await disputesCollection.insertOne(disputeDoc);
+
+      await ordersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            isDisputed: true,
+            disputeId: insertResult.insertedId,
+            disputeStatus: "opened",
+            updatedAt: now,
+          },
+        }
+      );
+
+      res.status(201).json({
+        success: true,
+        message: "Dispute submitted successfully",
+        disputeId: insertResult.insertedId,
+        dispute: { ...disputeDoc, _id: insertResult.insertedId },
+      });
+    } catch (error) {
+      console.error("Create dispute error:", error.message || error);
+      res.status(500).json({ message: "Failed to create dispute" });
+    }
+  }
+);
+
+/**
+ * GET /api/orders/:id/dispute
+ * Retrieves the dispute record associated with an order.
+ */
+router.get(
+  "/api/orders/:id/dispute",
+  verifyToken,
+  requireRole("buyer", "seller", "admin"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid order ID format" });
+      }
+
+      const { ordersCollection, disputesCollection } = getCollections();
+      if (!ordersCollection || !disputesCollection) {
+        return res
+          .status(503)
+          .json({ message: "Service Unavailable: Database not connected" });
+      }
+
+      const order = await ordersCollection.findOne({ _id: new ObjectId(id) });
+      if (!order) {
+        return res.status(404).json({ message: "Order not found" });
+      }
+
+      const buyerEmail = extractEmail(order.buyerInfo);
+      const sellerEmail = extractEmail(order.sellerInfo);
+
+      if (
+        req.user.role !== "admin" &&
+        buyerEmail !== req.user.email &&
+        sellerEmail !== req.user.email
+      ) {
+        return res.status(403).json({
+          message: "Forbidden: You are not authorized to view this dispute",
+        });
+      }
+
+      const dispute = await disputesCollection.findOne({
+        $or: [{ orderId: id }, { orderObjectId: new ObjectId(id) }],
+      });
+      res.status(200).json(dispute || null);
+    } catch (error) {
+      console.error("Get order dispute error:", error.message || error);
+      res.status(500).json({ message: "Failed to fetch dispute" });
+    }
+  }
+);
+
 module.exports = router;

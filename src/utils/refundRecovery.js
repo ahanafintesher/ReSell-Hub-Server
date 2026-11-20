@@ -1,3 +1,4 @@
+const { ObjectId } = require("mongodb");
 const { getCollections } = require("../config/db");
 const { getStripeInstance } = require("../config/stripe");
 
@@ -21,7 +22,7 @@ async function processPendingRefunds(options = {}) {
   const lockTimeoutMs = 5 * 60 * 1000; // 5 minute claim lock
   const staleClaimThreshold = new Date(now.getTime() - lockTimeoutMs);
 
-  const { ordersCollection, paymentsCollection } = getCollections();
+  const { ordersCollection, paymentsCollection, disputesCollection } = getCollections();
   const stripe = getStripeInstance();
 
   if (!stripe || (!ordersCollection && !paymentsCollection)) {
@@ -119,7 +120,11 @@ async function processPendingRefunds(options = {}) {
           continue;
         }
 
-        const idempotencyKey = getRefundIdempotencyKey(order._id, "order_cancel");
+        const isDisputedOrder = Boolean(order.isDisputed || order.disputeResolution === "resolved_buyer" || order.disputeId);
+        const idempotencyKey = getRefundIdempotencyKey(
+          order._id,
+          isDisputedOrder ? "dispute_refund" : "order_cancel"
+        );
 
         try {
           const refund = await stripe.refunds.create(
@@ -154,6 +159,24 @@ async function processPendingRefunds(options = {}) {
                     refundStatus: finalStatus,
                     refundId: refund.id,
                     refundQueue: finalStatus !== "refunded",
+                    updatedAt: new Date(),
+                  },
+                }
+              );
+            }
+
+            if (disputesCollection && isDisputedOrder) {
+              await disputesCollection.updateOne(
+                {
+                  $or: [
+                    { orderId: String(order._id) },
+                    ...(ObjectId.isValid(order._id) ? [{ orderObjectId: new ObjectId(order._id) }] : []),
+                  ],
+                },
+                {
+                  $set: {
+                    refundStatus: finalStatus,
+                    refundId: refund.id,
                     updatedAt: new Date(),
                   },
                 }

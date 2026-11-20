@@ -67,6 +67,7 @@ router.post(
       ordersCollection,
       productsCollection,
       processedEventsCollection,
+      disputesCollection,
     } = getCollections();
     if (!paymentsCollection || !ordersCollection) {
       console.error("Stripe webhook error: Database collections not ready");
@@ -635,6 +636,76 @@ router.post(
           }
           await markEventCompleted();
           return res.status(200).json({ received: true, status: "failed" });
+        }
+
+        case "charge.refunded": {
+          const charge = event.data.object;
+          const paymentIntentId = charge.payment_intent;
+          const refund = charge.refunds?.data?.[0];
+          const refundId = refund?.id;
+          const isSucceeded = refund ? refund.status === "succeeded" : charge.refunded === true;
+          const finalRefundStatus = isSucceeded ? "refunded" : "pending_refund";
+
+          if (ordersCollection && paymentIntentId) {
+            const orderDoc = await ordersCollection.findOne({
+              $or: [
+                { transactionId: paymentIntentId },
+                { paymentId: paymentIntentId },
+              ],
+            });
+
+            if (orderDoc) {
+              const orderUpdate = {
+                refundStatus: finalRefundStatus,
+                refundQueue: !isSucceeded,
+                updatedAt: new Date(),
+              };
+              if (refundId) orderUpdate.refundId = refundId;
+              if (isSucceeded) orderUpdate.refundSuccessAt = new Date();
+
+              await ordersCollection.updateOne({ _id: orderDoc._id }, { $set: orderUpdate });
+
+              if (disputesCollection) {
+                await disputesCollection.updateOne(
+                  {
+                    $or: [
+                      { orderId: String(orderDoc._id) },
+                      ...(ObjectId.isValid(orderDoc._id) ? [{ orderObjectId: new ObjectId(orderDoc._id) }] : []),
+                    ],
+                  },
+                  {
+                    $set: {
+                      refundStatus: finalRefundStatus,
+                      ...(refundId ? { refundId } : {}),
+                      updatedAt: new Date(),
+                    },
+                  }
+                );
+              }
+            }
+          }
+
+          if (paymentsCollection && paymentIntentId) {
+            await paymentsCollection.updateOne(
+              {
+                $or: [
+                  { transactionId: paymentIntentId },
+                  { session_id: paymentIntentId },
+                ],
+              },
+              {
+                $set: {
+                  refundStatus: finalRefundStatus,
+                  refundQueue: !isSucceeded,
+                  ...(refundId ? { refundId } : {}),
+                  updatedAt: new Date(),
+                },
+              }
+            );
+          }
+
+          await markEventCompleted();
+          return res.status(200).json({ received: true, refundStatus: finalRefundStatus });
         }
 
         default:
