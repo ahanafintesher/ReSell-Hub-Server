@@ -11,6 +11,8 @@ const {
 const { setStripeInstance } = require("./src/config/stripe");
 const {
   verifyToken,
+  optionalVerifyToken,
+  publicOptionalVerifyToken,
   requireRole,
   getUserRole,
   validateUserIdentity,
@@ -101,6 +103,8 @@ if (require.main === module) {
 module.exports = {
   app,
   verifyToken,
+  optionalVerifyToken,
+  publicOptionalVerifyToken,
   requireRole,
   getUserRole,
   validateUserIdentity,

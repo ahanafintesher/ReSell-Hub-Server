@@ -4,6 +4,7 @@ const { getCollections } = require("../config/db");
 const {
   verifyToken,
   optionalVerifyToken,
+  publicOptionalVerifyToken,
   requireRole,
   validateUserIdentity,
 } = require("../middleware/auth");
@@ -128,7 +129,7 @@ router.get(
 );
 
 // Get all products (Public with Search, Filter, Sort, Pagination; Admin can view all moderation statuses)
-router.get("/api/products", optionalVerifyToken, async (req, res) => {
+router.get("/api/products", publicOptionalVerifyToken, async (req, res) => {
   try {
     const { productsCollection } = getCollections();
     if (!productsCollection) {

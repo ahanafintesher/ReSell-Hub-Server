@@ -468,8 +468,8 @@ describe("Blocked User Access Protection Audit & Verification Suite", () => {
     });
   });
 
-  describe("4. Blocked user cannot access Product Details API with an authenticated token", () => {
-    it("GET /api/products/:id with blocked user token returns 403 ACCOUNT_BLOCKED (not anonymous fallback)", async () => {
+  describe("4. Public Product Listing ALLOW vs Product Details BLOCK for Blocked Users", () => {
+    it("GET /api/products/:id with blocked user token returns 403 ACCOUNT_BLOCKED (strictly blocked from product details)", async () => {
       const blockedToken = await createTestToken({
         sub: blockedBuyerId,
         email: "blocked.buyer@example.com",
@@ -491,7 +491,7 @@ describe("Blocked User Access Protection Audit & Verification Suite", () => {
       assert.strictEqual(data.code, "ACCOUNT_BLOCKED");
     });
 
-    it("GET /api/products with blocked user token returns 403 ACCOUNT_BLOCKED", async () => {
+    it("GET /api/products with blocked user token returns 200 (ALLOW public product browsing)", async () => {
       const blockedToken = await createTestToken({
         sub: blockedBuyerId,
         email: "blocked.buyer@example.com",
@@ -500,14 +500,85 @@ describe("Blocked User Access Protection Audit & Verification Suite", () => {
       const res = await fetch(`${baseUrl}/api/products`, {
         headers: { Authorization: `Bearer ${blockedToken}` },
       });
-      assert.strictEqual(res.status, 403);
+      assert.strictEqual(res.status, 200);
       const data = await res.json();
-      assert.strictEqual(data.success, false);
-      assert.strictEqual(
-        data.message,
-        "Your account has been blocked by an administrator."
-      );
-      assert.strictEqual(data.code, "ACCOUNT_BLOCKED");
+      assert.ok(Array.isArray(data));
+      assert.strictEqual(data.length, 1);
+      assert.strictEqual(data[0].title, "Canon DSLR Camera");
+      assert.strictEqual(data[0].status, "available");
+    });
+
+    it("GET /api/products preserves filtering, search, and pagination for blocked users", async () => {
+      const blockedToken = await createTestToken({
+        sub: blockedBuyerId,
+        email: "blocked.buyer@example.com",
+      });
+
+      // Filter by category
+      const catRes = await fetch(`${baseUrl}/api/products?category=Electronics`, {
+        headers: { Authorization: `Bearer ${blockedToken}` },
+      });
+      assert.strictEqual(catRes.status, 200);
+      const catList = await catRes.json();
+      assert.strictEqual(catList.length, 1);
+
+      // Search by title
+      const searchRes = await fetch(`${baseUrl}/api/products?search=Canon`, {
+        headers: { Authorization: `Bearer ${blockedToken}` },
+      });
+      assert.strictEqual(searchRes.status, 200);
+      const searchList = await searchRes.json();
+      assert.strictEqual(searchList.length, 1);
+
+      // Pagination
+      const pageRes = await fetch(`${baseUrl}/api/products?page=1&limit=5`, {
+        headers: { Authorization: `Bearer ${blockedToken}` },
+      });
+      assert.strictEqual(pageRes.status, 200);
+      const pageData = await pageRes.json();
+      assert.strictEqual(pageData.total, 1);
+      assert.strictEqual(pageData.products.length, 1);
+    });
+
+    it("GET /api/products with blocked admin token does not leak pending products (treated as anonymous public view)", async () => {
+      // User with role 'admin' but status 'blocked'
+      const blockedAdminId = "60c72b2f9b1d8b2bad000099";
+      await mockUsers.insertOne({
+        _id: new ObjectId(blockedAdminId),
+        email: "blocked.admin@example.com",
+        name: "Blocked Admin",
+        role: "admin",
+        status: "blocked",
+      });
+
+      const blockedAdminToken = await createTestToken({
+        sub: blockedAdminId,
+        email: "blocked.admin@example.com",
+      });
+
+      // Attempt to query pending products with status=pending
+      const res = await fetch(`${baseUrl}/api/products?status=pending`, {
+        headers: { Authorization: `Bearer ${blockedAdminToken}` },
+      });
+      assert.strictEqual(res.status, 200);
+      const list = await res.json();
+      // Blocked admin cannot bypass moderation visibility; receives empty list
+      assert.strictEqual(list.length, 0);
+    });
+
+    it("GET /api/products with active admin token can query ?status=pending", async () => {
+      const adminToken = await createTestToken({
+        sub: adminId,
+        email: "admin@example.com",
+      });
+
+      const res = await fetch(`${baseUrl}/api/products?status=pending`, {
+        headers: { Authorization: `Bearer ${adminToken}` },
+      });
+      assert.strictEqual(res.status, 200);
+      const list = await res.json();
+      assert.strictEqual(list.length, 1);
+      assert.strictEqual(list[0].title, "Pending Smartphone Listing");
     });
   });
 

@@ -125,81 +125,95 @@ const verifyToken = async (req, res, next) => {
   }
 };
 
-// Optional Auth Middleware: If valid Bearer token provided, populates req.user. Otherwise leaves req.user = null without throwing.
-const optionalVerifyToken = async (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) {
-    req.user = null;
-    return next();
-  }
+// Optional Auth Middleware Factory:
+// - blockBlockedUsers: true (default for endpoints like product details): rejects blocked accounts with 403.
+// - blockBlockedUsers: false (for public product listings): treats blocked accounts as anonymous (req.user = null) without throwing 403.
+const createOptionalVerifyToken = (options = {}) => {
+  const { blockBlockedUsers = true } = options;
 
-  const parts = authHeader.split(" ");
-  if (parts.length !== 2 || parts[0] !== "Bearer") {
-    req.user = null;
-    return next();
-  }
-
-  const token = parts[1];
-  try {
-    const key =
-      customKeySet ||
-      (config.JWT_SECRET
-        ? new TextEncoder().encode(config.JWT_SECRET)
-        : JWKS);
-
-    const { payload } = await jwtVerify(token, key, {
-      issuer: config.JWT_ISSUER,
-      audience: config.JWT_AUDIENCE,
-    });
-
-    if (
-      !payload.email ||
-      typeof payload.email !== "string" ||
-      !payload.email.trim()
-    ) {
+  return async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
       req.user = null;
       return next();
     }
 
-    const email = payload.email.trim();
-    const { usersCollection } = getCollections();
+    const parts = authHeader.split(" ");
+    if (parts.length !== 2 || parts[0] !== "Bearer") {
+      req.user = null;
+      return next();
+    }
 
-    if (usersCollection) {
-      let dbUser = await usersCollection.findOne({ email });
-      if (!dbUser && payload.sub) {
-        const idQuery = ObjectId.isValid(payload.sub)
-          ? { _id: new ObjectId(payload.sub) }
-          : { _id: payload.sub };
-        dbUser = await usersCollection.findOne(idQuery);
+    const token = parts[1];
+    try {
+      const key =
+        customKeySet ||
+        (config.JWT_SECRET
+          ? new TextEncoder().encode(config.JWT_SECRET)
+          : JWKS);
+
+      const { payload } = await jwtVerify(token, key, {
+        issuer: config.JWT_ISSUER,
+        audience: config.JWT_AUDIENCE,
+      });
+
+      if (
+        !payload.email ||
+        typeof payload.email !== "string" ||
+        !payload.email.trim()
+      ) {
+        req.user = null;
+        return next();
       }
 
-      // Reject blocked accounts even on optional auth routes (do not silently treat as anonymous)
-      if (dbUser && dbUser.status === "blocked") {
-        return res.status(403).json(BLOCKED_ACCOUNT_RESPONSE);
-      }
+      const email = payload.email.trim();
+      const { usersCollection } = getCollections();
 
-      if (dbUser) {
-        req.user = {
-          ...payload,
-          id: dbUser._id ? dbUser._id.toString() : payload.sub,
-          email: dbUser.email || email,
-          name: dbUser.name || payload.name || "User",
-          role: dbUser.role || "buyer",
-          status: dbUser.status || "active",
-          dbUser,
-        };
+      if (usersCollection) {
+        let dbUser = await usersCollection.findOne({ email });
+        if (!dbUser && payload.sub) {
+          const idQuery = ObjectId.isValid(payload.sub)
+            ? { _id: new ObjectId(payload.sub) }
+            : { _id: payload.sub };
+          dbUser = await usersCollection.findOne(idQuery);
+        }
+
+        // Check blocked account status
+        if (dbUser && dbUser.status === "blocked") {
+          if (blockBlockedUsers) {
+            return res.status(403).json(BLOCKED_ACCOUNT_RESPONSE);
+          }
+          // On public listing routes, treat blocked account as anonymous without returning 403
+          req.user = null;
+          return next();
+        }
+
+        if (dbUser) {
+          req.user = {
+            ...payload,
+            id: dbUser._id ? dbUser._id.toString() : payload.sub,
+            email: dbUser.email || email,
+            name: dbUser.name || payload.name || "User",
+            role: dbUser.role || "buyer",
+            status: dbUser.status || "active",
+            dbUser,
+          };
+        } else {
+          req.user = null;
+        }
       } else {
         req.user = null;
       }
-    } else {
+      next();
+    } catch {
       req.user = null;
+      next();
     }
-    next();
-  } catch {
-    req.user = null;
-    next();
-  }
+  };
 };
+
+const optionalVerifyToken = createOptionalVerifyToken({ blockBlockedUsers: true });
+const publicOptionalVerifyToken = createOptionalVerifyToken({ blockBlockedUsers: false });
 
 // Server-controlled role verification helper
 const getUserRole = async (user) => {
@@ -271,6 +285,7 @@ const requireRole = (...allowedRoles) => {
 module.exports = {
   verifyToken,
   optionalVerifyToken,
+  publicOptionalVerifyToken,
   requireRole,
   getUserRole,
   validateUserIdentity,
