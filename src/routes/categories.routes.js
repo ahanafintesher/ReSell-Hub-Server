@@ -125,4 +125,89 @@ router.CATEGORY_PRIORITY_MAP = CATEGORY_PRIORITY_MAP;
 router.getCategoryPriority = getCategoryPriority;
 router.sortCategories = sortCategories;
 
+// ──────────────────────────────────────────
+// FEATURED CATEGORIES API
+// ──────────────────────────────────────────
+
+/**
+ * Filters and sorts categories for the featured categories endpoint:
+ * 1. Only active categories (isActive: true).
+ * 2. Predefined featured categories only (excludes "Others" and unknown categories).
+ * 3. Exact custom priority order:
+ *    Electronics (1), Audio (2), Wearables (3), Accessories (4),
+ *    Fashion (5), Furniture (6), Vehicles (7), Mobile Phones (8).
+ * 4. Maximum limit of 8 items.
+ *
+ * @param {Array<object>} categories
+ * @param {number} [limit=8]
+ * @returns {Array<object>}
+ */
+function getFeaturedCategories(categories, limit = 8) {
+  if (!Array.isArray(categories)) return [];
+
+  const eligible = categories.filter(
+    (cat) => cat && cat.isActive === true && CATEGORY_PRIORITY_MAP.has(cat.name)
+  );
+
+  eligible.sort((a, b) => {
+    return CATEGORY_PRIORITY_MAP.get(a.name) - CATEGORY_PRIORITY_MAP.get(b.name);
+  });
+
+  return eligible.slice(0, limit);
+}
+
+/**
+ * GET /api/v1/featured, GET /api/featured, GET /featured
+ * Public endpoint returning exactly 8 featured categories in custom business order.
+ * Excludes inactive categories, "Others", and unknown categories.
+ */
+router.get(
+  ["/api/v1/featured", "/api/featured", "/featured"],
+  async (req, res) => {
+    try {
+      const { categoriesCollection } = getCollections();
+
+      if (!categoriesCollection) {
+        return res.status(503).json({
+          success: false,
+          message: "Service Unavailable: Database not connected",
+        });
+      }
+
+      const categories = await categoriesCollection
+        .find(
+          {
+            isActive: true,
+            name: { $in: PREDEFINED_CATEGORY_ORDER },
+          },
+          { projection: { _id: 1, name: 1, description: 1, isActive: 1 } }
+        )
+        .toArray();
+
+      const sanitizedCategories = categories.map((cat) => ({
+        _id: cat._id,
+        name: cat.name,
+        description: cat.description,
+        isActive: cat.isActive,
+      }));
+
+      const featuredCategories = getFeaturedCategories(sanitizedCategories, 8);
+
+      res.status(200).json({
+        success: true,
+        message: "Featured categories fetched successfully",
+        data: featuredCategories,
+      });
+    } catch (error) {
+      console.error("Featured categories fetch error:", error.message || error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch featured categories",
+      });
+    }
+  }
+);
+
+router.getFeaturedCategories = getFeaturedCategories;
+
 module.exports = router;

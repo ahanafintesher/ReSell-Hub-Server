@@ -497,4 +497,351 @@ describe("Categories Collection & Public API Test Suite", () => {
       });
     });
   });
+
+  describe("4. Featured Categories API Endpoint (GET /api/v1/featured)", () => {
+    const EXPECTED_FEATURED_ORDER = [
+      "Electronics",
+      "Audio",
+      "Wearables",
+      "Accessories",
+      "Fashion",
+      "Furniture",
+      "Vehicles",
+      "Mobile Phones",
+    ];
+
+    it("GET /api/v1/featured returns 200 with exactly 8 categories in exact custom order", async () => {
+      const mockCategories = createMockCollection([]);
+      await seedCategories(mockCategories);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const res = await fetch(`${baseUrl}/api/v1/featured`);
+      assert.strictEqual(res.status, 200);
+
+      const json = await res.json();
+      assert.strictEqual(json.success, true);
+      assert.strictEqual(json.message, "Featured categories fetched successfully");
+      assert.ok(Array.isArray(json.data));
+      assert.strictEqual(json.data.length, 8, "Must contain exactly 8 featured categories");
+
+      const names = json.data.map((c) => c.name);
+      assert.deepStrictEqual(names, EXPECTED_FEATURED_ORDER);
+
+      // Verify fields
+      for (const cat of json.data) {
+        assert.strictEqual(cat.isActive, true);
+        assert.ok(cat._id);
+        assert.ok(typeof cat.description === "string");
+        assert.ok(typeof cat.name === "string");
+      }
+    });
+
+    it("excludes 'Others' from featured categories", async () => {
+      const mockCategories = createMockCollection([]);
+      await seedCategories(mockCategories);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const res = await fetch(`${baseUrl}/api/v1/featured`);
+      assert.strictEqual(res.status, 200);
+
+      const json = await res.json();
+      const names = json.data.map((c) => c.name);
+      assert.strictEqual(names.includes("Others"), false, "'Others' must be strictly excluded from /featured");
+    });
+
+    it("GET /api/featured and GET /featured aliases return identical 8 featured categories", async () => {
+      const mockCategories = createMockCollection([]);
+      await seedCategories(mockCategories);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const resApi = await fetch(`${baseUrl}/api/featured`);
+      assert.strictEqual(resApi.status, 200);
+      const jsonApi = await resApi.json();
+      assert.deepStrictEqual(
+        jsonApi.data.map((c) => c.name),
+        EXPECTED_FEATURED_ORDER
+      );
+
+      const resRoot = await fetch(`${baseUrl}/featured`);
+      assert.strictEqual(resRoot.status, 200);
+      const jsonRoot = await resRoot.json();
+      assert.deepStrictEqual(
+        jsonRoot.data.map((c) => c.name),
+        EXPECTED_FEATURED_ORDER
+      );
+    });
+
+    it("does not depend on MongoDB natural or insertion order", async () => {
+      const reversedCategories = [...INITIAL_CATEGORIES].reverse();
+      const mockCategories = createMockCollection(reversedCategories);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const res = await fetch(`${baseUrl}/api/v1/featured`);
+      assert.strictEqual(res.status, 200);
+
+      const json = await res.json();
+      const names = json.data.map((c) => c.name);
+      assert.deepStrictEqual(names, EXPECTED_FEATURED_ORDER);
+    });
+
+    it("excludes inactive categories and preserves relative predefined order", async () => {
+      const mockCategories = createMockCollection([]);
+      await seedCategories(mockCategories);
+
+      // Deactivate Audio and Fashion
+      const audio = mockCategories._docs.find((c) => c.name === "Audio");
+      audio.isActive = false;
+      const fashion = mockCategories._docs.find((c) => c.name === "Fashion");
+      fashion.isActive = false;
+
+      setCollections({ categoriesCollection: mockCategories });
+
+      const res = await fetch(`${baseUrl}/api/v1/featured`);
+      assert.strictEqual(res.status, 200);
+
+      const json = await res.json();
+      assert.strictEqual(json.data.length, 6);
+      assert.ok(!json.data.some((c) => c.name === "Audio" || c.name === "Fashion"));
+
+      const expectedFiltered = [
+        "Electronics",
+        "Wearables",
+        "Accessories",
+        "Furniture",
+        "Vehicles",
+        "Mobile Phones",
+      ];
+      assert.deepStrictEqual(
+        json.data.map((c) => c.name),
+        expectedFiltered
+      );
+    });
+
+    it("excludes unknown categories from featured response", async () => {
+      const mockData = [
+        ...INITIAL_CATEGORIES,
+        {
+          _id: "cat_gaming",
+          name: "Gaming Consoles",
+          description: "Consoles and games",
+          isActive: true,
+        },
+        {
+          _id: "cat_books",
+          name: "Books",
+          description: "Reading materials",
+          isActive: true,
+        },
+      ];
+
+      const mockCategories = createMockCollection(mockData);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const res = await fetch(`${baseUrl}/api/v1/featured`);
+      assert.strictEqual(res.status, 200);
+
+      const json = await res.json();
+      assert.strictEqual(json.data.length, 8);
+      const names = json.data.map((c) => c.name);
+      assert.deepStrictEqual(names, EXPECTED_FEATURED_ORDER);
+      assert.strictEqual(names.includes("Gaming Consoles"), false);
+      assert.strictEqual(names.includes("Books"), false);
+    });
+
+    it("returns available matching categories without crashing if fewer than 8 exist", async () => {
+      const partialData = [
+        {
+          _id: "cat_elec",
+          name: "Electronics",
+          description: "Electronics description",
+          isActive: true,
+        },
+        {
+          _id: "cat_audio",
+          name: "Audio",
+          description: "Audio description",
+          isActive: true,
+        },
+        {
+          _id: "cat_fash",
+          name: "Fashion",
+          description: "Fashion description",
+          isActive: true,
+        },
+      ];
+
+      const mockCategories = createMockCollection(partialData);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const res = await fetch(`${baseUrl}/api/v1/featured`);
+      assert.strictEqual(res.status, 200);
+
+      const json = await res.json();
+      assert.strictEqual(json.success, true);
+      assert.strictEqual(json.data.length, 3);
+      assert.deepStrictEqual(
+        json.data.map((c) => c.name),
+        ["Electronics", "Audio", "Fashion"]
+      );
+    });
+
+    it("returns empty data array if no active featured categories exist", async () => {
+      const mockCategories = createMockCollection([]);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const res = await fetch(`${baseUrl}/api/v1/featured`);
+      assert.strictEqual(res.status, 200);
+
+      const json = await res.json();
+      assert.strictEqual(json.success, true);
+      assert.deepStrictEqual(json.data, []);
+    });
+
+    it("fetches dynamic data from MongoDB and preserves existing IDs and custom descriptions", async () => {
+      const customDocs = [
+        {
+          _id: "custom_id_electronics_999",
+          name: "Electronics",
+          description: "Authoritative dynamic custom electronics text from DB",
+          isActive: true,
+        },
+      ];
+
+      const mockCategories = createMockCollection(customDocs);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const res = await fetch(`${baseUrl}/api/v1/featured`);
+      assert.strictEqual(res.status, 200);
+
+      const json = await res.json();
+      assert.strictEqual(json.data.length, 1);
+      assert.strictEqual(json.data[0]._id, "custom_id_electronics_999");
+      assert.strictEqual(
+        json.data[0].description,
+        "Authoritative dynamic custom electronics text from DB"
+      );
+      assert.strictEqual(json.data[0].isActive, true);
+    });
+
+    it("does not expose unnecessary internal MongoDB fields", async () => {
+      const mockCategories = createMockCollection([
+        {
+          _id: "cat_elec_id",
+          name: "Electronics",
+          description: "Laptops and tech gear",
+          isActive: true,
+          __v: 0,
+          internalClusterId: "node-xyz-secret",
+          mongoInternalState: { version: 1 },
+        },
+      ]);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const res = await fetch(`${baseUrl}/api/v1/featured`);
+      assert.strictEqual(res.status, 200);
+
+      const json = await res.json();
+      assert.strictEqual(json.data.length, 1);
+      const keys = Object.keys(json.data[0]);
+      assert.deepStrictEqual(keys.sort(), ["_id", "description", "isActive", "name"].sort());
+      assert.strictEqual(json.data[0].__v, undefined);
+      assert.strictEqual(json.data[0].internalClusterId, undefined);
+    });
+
+    it("ensures existing /categories endpoint remains unchanged and continues to return all 9 categories", async () => {
+      const mockCategories = createMockCollection([]);
+      await seedCategories(mockCategories);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const catRes = await fetch(`${baseUrl}/api/v1/categories`);
+      assert.strictEqual(catRes.status, 200);
+      const catJson = await catRes.json();
+      assert.strictEqual(catJson.data.length, 9, "Standard categories API must return 9 categories");
+      assert.strictEqual(catJson.data[8].name, "Others", "Standard categories API must include 'Others' at the end");
+
+      const featRes = await fetch(`${baseUrl}/api/v1/featured`);
+      assert.strictEqual(featRes.status, 200);
+      const featJson = await featRes.json();
+      assert.strictEqual(featJson.data.length, 8, "Featured API must return exactly 8 categories");
+      assert.ok(!featJson.data.some((c) => c.name === "Others"));
+    });
+
+    it("does not require authentication or authorization tokens (public access)", async () => {
+      const mockCategories = createMockCollection([]);
+      await seedCategories(mockCategories);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const res = await fetch(`${baseUrl}/api/v1/featured`, {
+        headers: {},
+      });
+      assert.strictEqual(res.status, 200);
+    });
+
+    it("returns 503 Service Unavailable when database is not connected", async () => {
+      setCollections({ categoriesCollection: null });
+
+      const res = await fetch(`${baseUrl}/api/v1/featured`);
+      assert.strictEqual(res.status, 503);
+
+      const json = await res.json();
+      assert.strictEqual(json.success, false);
+      assert.match(json.message, /Database not connected/);
+    });
+
+    it("returns 500 Internal Server Error when database query fails", async () => {
+      const brokenCollection = {
+        find() {
+          throw new Error("Simulated database query fault");
+        },
+      };
+      setCollections({ categoriesCollection: brokenCollection });
+
+      const res = await fetch(`${baseUrl}/api/v1/featured`);
+      assert.strictEqual(res.status, 500);
+
+      const json = await res.json();
+      assert.strictEqual(json.success, false);
+      assert.strictEqual(json.message, "Failed to fetch featured categories");
+    });
+  });
+
+  describe("5. Unit Tests: Featured Categories Filter & Sorter", () => {
+    it("getFeaturedCategories handles invalid inputs safely", () => {
+      const { getFeaturedCategories } = categoriesRoutes;
+      assert.deepStrictEqual(getFeaturedCategories(null), []);
+      assert.deepStrictEqual(getFeaturedCategories(undefined), []);
+      assert.deepStrictEqual(getFeaturedCategories([]), []);
+      assert.deepStrictEqual(getFeaturedCategories("not-an-array"), []);
+    });
+
+    it("getFeaturedCategories filters inactive items and respects limit", () => {
+      const { getFeaturedCategories } = categoriesRoutes;
+      const input = [
+        { name: "Electronics", isActive: true },
+        { name: "Audio", isActive: false },
+        { name: "Wearables", isActive: true },
+        { name: "Accessories", isActive: true },
+      ];
+
+      const result = getFeaturedCategories(input, 2);
+      assert.strictEqual(result.length, 2);
+      assert.strictEqual(result[0].name, "Electronics");
+      assert.strictEqual(result[1].name, "Wearables");
+    });
+
+    it("getFeaturedCategories excludes 'Others' and unknown categories", () => {
+      const { getFeaturedCategories } = categoriesRoutes;
+      const input = [
+        { name: "Others", isActive: true },
+        { name: "Unknown Category", isActive: true },
+        { name: "Mobile Phones", isActive: true },
+        { name: "Electronics", isActive: true },
+      ];
+
+      const result = getFeaturedCategories(input, 8);
+      assert.strictEqual(result.length, 2);
+      assert.strictEqual(result[0].name, "Electronics");
+      assert.strictEqual(result[1].name, "Mobile Phones");
+    });
+  });
 });
