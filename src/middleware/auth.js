@@ -5,6 +5,12 @@ const { getCollections } = require("../config/db");
 
 const JWKS = createRemoteJWKSet(new URL(config.JWKS_URL));
 
+const BLOCKED_ACCOUNT_RESPONSE = Object.freeze({
+  success: false,
+  message: "Your account has been blocked by an administrator.",
+  code: "ACCOUNT_BLOCKED",
+});
+
 let customKeySet = null;
 const setVerificationKey = (key) => {
   customKeySet = key;
@@ -89,9 +95,7 @@ const verifyToken = async (req, res, next) => {
 
       // Reject blocked accounts on every authenticated route
       if (dbUser.status === "blocked") {
-        return res
-          .status(403)
-          .json({ message: "Forbidden: Account is blocked" });
+        return res.status(403).json(BLOCKED_ACCOUNT_RESPONSE);
       }
 
       // Authoritative role from MongoDB - never trust JWT payload role alone
@@ -169,7 +173,12 @@ const optionalVerifyToken = async (req, res, next) => {
         dbUser = await usersCollection.findOne(idQuery);
       }
 
-      if (dbUser && dbUser.status !== "blocked") {
+      // Reject blocked accounts even on optional auth routes (do not silently treat as anonymous)
+      if (dbUser && dbUser.status === "blocked") {
+        return res.status(403).json(BLOCKED_ACCOUNT_RESPONSE);
+      }
+
+      if (dbUser) {
         req.user = {
           ...payload,
           id: dbUser._id ? dbUser._id.toString() : payload.sub,
@@ -241,9 +250,7 @@ const requireRole = (...allowedRoles) => {
 
     // Reject blocked accounts
     if (dbUser && dbUser.status === "blocked") {
-      return res
-        .status(403)
-        .json({ message: "Forbidden: Account is blocked" });
+      return res.status(403).json(BLOCKED_ACCOUNT_RESPONSE);
     }
 
     // Authoritative role from database
@@ -268,4 +275,5 @@ module.exports = {
   getUserRole,
   validateUserIdentity,
   setVerificationKey,
+  BLOCKED_ACCOUNT_RESPONSE,
 };

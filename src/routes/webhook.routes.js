@@ -556,6 +556,7 @@ router.post(
             await productsCollection.updateOne(productQuery, {
               $set: {
                 status: "sold",
+                isPubliclyVisible: false,
                 soldTo: buyerEmail,
                 soldPaymentId: currentSessionId,
                 updatedAt: new Date(),

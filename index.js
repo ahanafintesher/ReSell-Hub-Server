@@ -15,6 +15,7 @@ const {
   getUserRole,
   validateUserIdentity,
   setVerificationKey,
+  BLOCKED_ACCOUNT_RESPONSE,
 } = require("./src/middleware/auth");
 const {
   notFoundHandler,
@@ -110,4 +111,5 @@ module.exports = {
   close,
   createIndexes,
   client,
+  BLOCKED_ACCOUNT_RESPONSE,
 };

@@ -429,7 +429,12 @@ describe("Security Hardening Regression Test Suite (Phase 2A)", () => {
       });
       assert.strictEqual(res.status, 403);
       const data = await res.json();
-      assert.match(data.message, /Account is blocked/i);
+      assert.strictEqual(data.success, false);
+      assert.strictEqual(data.code, "ACCOUNT_BLOCKED");
+      assert.strictEqual(
+        data.message,
+        "Your account has been blocked by an administrator."
+      );
     });
 
     it("rejects blocked user on route using verifyToken alone (POST /api/reviews) (403)", async () => {
@@ -448,7 +453,12 @@ describe("Security Hardening Regression Test Suite (Phase 2A)", () => {
       });
       assert.strictEqual(res.status, 403);
       const data = await res.json();
-      assert.match(data.message, /Account is blocked/i);
+      assert.strictEqual(data.success, false);
+      assert.strictEqual(data.code, "ACCOUNT_BLOCKED");
+      assert.strictEqual(
+        data.message,
+        "Your account has been blocked by an administrator."
+      );
     });
   });
 

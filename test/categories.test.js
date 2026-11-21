@@ -1,4 +1,4 @@
-const { test, it, describe, beforeEach, afterEach } = require("node:test");
+const { test, it, describe, before, after, beforeEach, afterEach } = require("node:test");
 const assert = require("node:assert");
 const http = require("node:http");
 const { app } = require("../index");
@@ -109,9 +109,7 @@ describe("Categories Collection & Public API Test Suite", () => {
   let server;
   let baseUrl;
 
-  beforeEach(async () => {
-    originalCollections = { ...getCollections() };
-
+  before(async () => {
     await new Promise((resolve) => {
       server = http.createServer(app);
       server.listen(0, () => {
@@ -122,11 +120,18 @@ describe("Categories Collection & Public API Test Suite", () => {
     });
   });
 
-  afterEach(async () => {
-    setCollections(originalCollections);
+  after(async () => {
     if (server) {
       await new Promise((resolve) => server.close(resolve));
     }
+  });
+
+  beforeEach(() => {
+    originalCollections = { ...getCollections() };
+  });
+
+  afterEach(() => {
+    setCollections(originalCollections);
   });
 
   describe("1. Category Seeding and Idempotency", () => {
