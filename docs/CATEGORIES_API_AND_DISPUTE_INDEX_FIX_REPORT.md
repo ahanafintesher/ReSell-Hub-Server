@@ -224,12 +224,15 @@ The previous `[INDEX NOTICE]` warning is completely eliminated.
 | **Category Seed Idempotency** | Re-running seeding multiple times | Exactly 9 documents retained; 0 duplicates | **Verified PASS** |
 | **Category Custom Data Preservation** | Pre-existing custom descriptions and inactive states | Preserved without overwrite via `$setOnInsert` | **Verified PASS** |
 | **Category Unique Index** | Unique index on `name` | Confirmed `{ name: 1 }, unique: true` in MongoDB | **Verified PASS** |
-| **GET /api/v1/categories** | Public HTTP 200 response | Returns 9 categories sorted alphabetically | **Verified PASS** |
-| **Route Aliases** | `/api/categories` and `/categories` | Responds identically to `/api/v1/categories` | **Verified PASS** |
+| **GET /api/v1/categories** | Public HTTP 200 response | Returns 9 categories in exact predefined sequence | **Verified PASS** |
+| **Route Aliases** | `/api/categories` and `/categories` | Responds identically in exact predefined sequence | **Verified PASS** |
 | **Inactive Filtering** | Inactive category exclusion | Categories with `isActive: false` omitted from payload | **Verified PASS** |
+| **Custom Sorting Order** | Priority map & ranking logic | Predefined sequence strictly enforced; 'Others' strictly last | **Verified PASS** |
+| **Unknown Category Safety** | Unexpected/new categories | Placed after predefined categories; 'Others' remains last | **Verified PASS** |
+| **Insertion Order Independence** | Scrambled/reversed DB records | Predefined sequence retained regardless of insertion order | **Verified PASS** |
 | **Dispute Index Migration** | Duplicate check and index replacement | 0 duplicates found; migrated to unique sparse index | **Verified PASS** |
 | **Startup Warning Removal** | Application startup logs | `[INDEX NOTICE]` completely resolved and silent | **Verified PASS** |
-| **Test Suite Regression** | Node.js native test suite | 202 tests passed across 74 suites, 0 failures | **Verified PASS** |
+| **Test Suite Regression** | Node.js native test suite | All test suites passing, 0 failures | **Verified PASS** |
 
 ---
 
@@ -237,3 +240,132 @@ The previous `[INDEX NOTICE]` warning is completely eliminated.
 
 - **Blockers:** None.
 - **Manual Actions Required:** None. All migrations and index updates have been safely completed and verified on the live database.
+
+---
+
+## 9. Categories API Custom Sorting Order Fix
+
+### 9.1 Previous Alphabetical Sorting Issue
+- **Previous Implementation:** In `src/routes/categories.routes.js`, categories were retrieved from MongoDB using `.find({ isActive: true }).sort({ name: 1 })`.
+- **Identified Issue:** Alphabetical sorting forced categories into a sequence based strictly on alphabetical order:
+  1. Accessories
+  2. Audio
+  3. Electronics
+  4. Fashion
+  5. Furniture
+  6. Mobile Phones
+  7. Others
+  8. Vehicles
+  9. Wearables
+- **Business Impact:** This violated product and marketplace design requirements. Core categories like `Electronics` and `Audio` were listed after `Accessories`, and `Others` was placed mid-list rather than at the very end. Furthermore, relying on database-level `.sort({ name: 1 })` precluded custom prioritization logic.
+
+### 9.2 New Custom Sorting Implementation
+- **Removed Database Alphabetical Constraint:** Removed `.sort({ name: 1 })` from the MongoDB query. The query now only filters active records (`{ isActive: true }`) with lean projection (`{ _id: 1, name: 1, description: 1, isActive: 1 }`).
+- **Priority Map Architecture:** Defined an explicit priority map (`CATEGORY_PRIORITY_MAP`) and helper function (`getCategoryPriority`) that maps predefined categories to strictly ordered ranks:
+  - `Electronics` -> 1
+  - `Audio` -> 2
+  - `Wearables` -> 3
+  - `Accessories` -> 4
+  - `Fashion` -> 5
+  - `Furniture` -> 6
+  - `Vehicles` -> 7
+  - `Mobile Phones` -> 8
+- **Safe Handling for Unknown / Future Categories:**
+  - Any category name not in the predefined map (e.g. newly introduced product categories) is assigned priority `9999`. Unknown categories appear after the 8 predefined primary categories and are sorted alphabetically among themselves.
+- **Guaranteed Placement of 'Others':**
+  - The `Others` category is explicitly assigned `Number.MAX_SAFE_INTEGER`, guaranteeing that it always appears at the very end of the response array, even if new or unknown categories exist.
+- **Independence from MongoDB Natural / Insertion Order:**
+  - Sorting is performed deterministically in memory after retrieval, ensuring the returned order is 100% independent of document insertion order, natural MongoDB storage layout, or database index changes.
+- **Data & Schema Integrity:**
+  - Retained all existing document fields (`_id`, `name`, `description`, `isActive`).
+  - Retained public unauthenticated access and route aliases (`/api/v1/categories`, `/api/categories`, `/categories`).
+  - Inactive categories (`isActive: false`) continue to be excluded at the database query level.
+
+### 9.3 Expected Category Order
+The `data` array in `GET /api/v1/categories` follows this exact sequence:
+
+1. **Electronics**
+2. **Audio**
+3. **Wearables**
+4. **Accessories**
+5. **Fashion**
+6. **Furniture**
+7. **Vehicles**
+8. **Mobile Phones**
+   *(Any unexpected/new active categories sorted alphabetically)*
+9. **Others** (strictly last)
+
+#### Example HTTP 200 Response Payload:
+```json
+{
+  "success": true,
+  "message": "Categories fetched successfully",
+  "data": [
+    {
+      "_id": "6b011c30c6c30b7882d37454",
+      "name": "Electronics",
+      "description": "Laptops, computers, displays, and consumer electronics tested and ready for use.",
+      "isActive": true
+    },
+    {
+      "_id": "6b011c30c6c30b7882d37455",
+      "name": "Audio",
+      "description": "Noise-cancelling headphones, wireless earbuds, premium speakers, and hi-fi gear.",
+      "isActive": true
+    },
+    {
+      "_id": "6b011c30c6c30b7882d37456",
+      "name": "Wearables",
+      "description": "Smartwatches, fitness bands, health sensors, and wearable smart accessories.",
+      "isActive": true
+    },
+    {
+      "_id": "6b011c30c6c30b7882d37457",
+      "name": "Accessories",
+      "description": "Ergonomic keyboards, mice, docking stations, chargers, and workspace cables.",
+      "isActive": true
+    },
+    {
+      "_id": "6b011c30c6c30b7882d37458",
+      "name": "Fashion",
+      "description": "Curated vintage apparel, jackets, shoes, designer streetwear, and everyday accessories.",
+      "isActive": true
+    },
+    {
+      "_id": "6b011c30c6c30b7882d37459",
+      "name": "Furniture",
+      "description": "Solid wood work desks, ergonomic task chairs, lighting, and living spaces.",
+      "isActive": true
+    },
+    {
+      "_id": "6b011c30c6c30b7882d3745a",
+      "name": "Vehicles",
+      "description": "Commuter bicycles, electric scooters, cycling helmets, and travel equipment.",
+      "isActive": true
+    },
+    {
+      "_id": "6b011c30c6c30b7882d3745b",
+      "name": "Mobile Phones",
+      "description": "Certified pre-owned smartphones, tablets, styluses, and protective cases.",
+      "isActive": true
+    },
+    {
+      "_id": "6b011c30c6c30b7882d3745c",
+      "name": "Others",
+      "description": "Collector's books, instruments, cameras, tools, hobby supplies, and rare finds.",
+      "isActive": true
+    }
+  ]
+}
+```
+
+### 9.4 Test Results & Verification
+- **Automated Test Suite:** `test/categories.test.js`
+- **Coverage & Invariants Verified:**
+  - Standard active categories return in the exact predefined 9-element order.
+  - Route aliases (`/api/categories`, `/categories`) return the exact same sorted order.
+  - Inactive categories (`isActive: false`) are filtered out while remaining items preserve relative order.
+  - Insertion order independence verified by inserting reversed documents in the database.
+  - Newly added or unknown categories safely place after the 8 primary categories and before `Others`.
+  - `Others` is verified to always remain at the very end of the array under all scenarios.
+  - Edge cases in the comparator and priority resolver verified via unit tests.

@@ -2,6 +2,7 @@ const { test, it, describe, beforeEach, afterEach } = require("node:test");
 const assert = require("node:assert");
 const http = require("node:http");
 const { app } = require("../index");
+const categoriesRoutes = require("../src/routes/categories.routes");
 const {
   setCollections,
   getCollections,
@@ -219,8 +220,20 @@ describe("Categories Collection & Public API Test Suite", () => {
     });
   });
 
-  describe("2. Public Categories API Endpoint", () => {
-    it("GET /api/v1/categories returns 200 with all 9 active categories sorted alphabetically", async () => {
+  describe("2. Public Categories API Endpoint & Custom Sorting", () => {
+    const EXPECTED_ORDER = [
+      "Electronics",
+      "Audio",
+      "Wearables",
+      "Accessories",
+      "Fashion",
+      "Furniture",
+      "Vehicles",
+      "Mobile Phones",
+      "Others",
+    ];
+
+    it("GET /api/v1/categories returns 200 with all 9 active categories in exact predefined order", async () => {
       const mockCategories = createMockCollection([]);
       await seedCategories(mockCategories);
       setCollections({ categoriesCollection: mockCategories });
@@ -234,20 +247,22 @@ describe("Categories Collection & Public API Test Suite", () => {
       assert.ok(Array.isArray(json.data));
       assert.strictEqual(json.data.length, 9);
 
-      // Verify alphabetical order
+      // Verify exact sequence
       const names = json.data.map((c) => c.name);
-      const sortedNames = [...names].sort();
-      assert.deepStrictEqual(names, sortedNames);
+      assert.deepStrictEqual(names, EXPECTED_ORDER);
+
+      // Verify Others is strictly last
+      assert.strictEqual(names[names.length - 1], "Others");
 
       // Verify fields
       const first = json.data[0];
-      assert.strictEqual(first.name, "Accessories");
+      assert.strictEqual(first.name, "Electronics");
       assert.strictEqual(first.isActive, true);
       assert.ok(first._id);
       assert.ok(first.description);
     });
 
-    it("GET /api/categories and GET /categories also resolve successfully (route aliases)", async () => {
+    it("GET /api/categories and GET /categories aliases return identical exact predefined order", async () => {
       const mockCategories = createMockCollection([]);
       await seedCategories(mockCategories);
       setCollections({ categoriesCollection: mockCategories });
@@ -255,21 +270,47 @@ describe("Categories Collection & Public API Test Suite", () => {
       const resApi = await fetch(`${baseUrl}/api/categories`);
       assert.strictEqual(resApi.status, 200);
       const jsonApi = await resApi.json();
-      assert.strictEqual(jsonApi.data.length, 9);
+      assert.deepStrictEqual(
+        jsonApi.data.map((c) => c.name),
+        EXPECTED_ORDER
+      );
 
       const resRoot = await fetch(`${baseUrl}/categories`);
       assert.strictEqual(resRoot.status, 200);
       const jsonRoot = await resRoot.json();
-      assert.strictEqual(jsonRoot.data.length, 9);
+      assert.deepStrictEqual(
+        jsonRoot.data.map((c) => c.name),
+        EXPECTED_ORDER
+      );
     });
 
-    it("excludes inactive categories from response", async () => {
+    it("does not depend on MongoDB natural document order or insertion order", async () => {
+      // Intentionally insert categories in reversed order into the collection
+      const reversedCategories = [...INITIAL_CATEGORIES].reverse();
+      const mockCategories = createMockCollection(reversedCategories);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const res = await fetch(`${baseUrl}/api/v1/categories`);
+      assert.strictEqual(res.status, 200);
+
+      const json = await res.json();
+      const names = json.data.map((c) => c.name);
+      assert.deepStrictEqual(
+        names,
+        EXPECTED_ORDER,
+        "Categories must strictly match predefined order regardless of database insertion/natural order"
+      );
+    });
+
+    it("excludes inactive categories while preserving relative predefined order", async () => {
       const mockCategories = createMockCollection([]);
       await seedCategories(mockCategories);
 
-      // Deactivate one category
-      const target = mockCategories._docs.find((c) => c.name === "Audio");
-      target.isActive = false;
+      // Deactivate "Audio" and "Fashion"
+      const audio = mockCategories._docs.find((c) => c.name === "Audio");
+      audio.isActive = false;
+      const fashion = mockCategories._docs.find((c) => c.name === "Fashion");
+      fashion.isActive = false;
 
       setCollections({ categoriesCollection: mockCategories });
 
@@ -277,8 +318,98 @@ describe("Categories Collection & Public API Test Suite", () => {
       assert.strictEqual(res.status, 200);
 
       const json = await res.json();
-      assert.strictEqual(json.data.length, 8);
-      assert.ok(!json.data.some((c) => c.name === "Audio"));
+      assert.strictEqual(json.data.length, 7);
+      assert.ok(!json.data.some((c) => c.name === "Audio" || c.name === "Fashion"));
+
+      const expectedFiltered = [
+        "Electronics",
+        "Wearables",
+        "Accessories",
+        "Furniture",
+        "Vehicles",
+        "Mobile Phones",
+        "Others",
+      ];
+      assert.deepStrictEqual(
+        json.data.map((c) => c.name),
+        expectedFiltered
+      );
+    });
+
+    it("handles unexpected or newly added categories safely with 'Others' strictly last", async () => {
+      // 9 standard categories + 3 unknown categories
+      const mockData = [
+        ...INITIAL_CATEGORIES,
+        {
+          _id: "cat_gaming",
+          name: "Gaming Consoles",
+          description: "Consoles and game gear",
+          isActive: true,
+        },
+        {
+          _id: "cat_books",
+          name: "Books",
+          description: "Novels and reference books",
+          isActive: true,
+        },
+        {
+          _id: "cat_art",
+          name: "Art & Collectibles",
+          description: "Paintings and sculptures",
+          isActive: true,
+        },
+      ];
+
+      const mockCategories = createMockCollection(mockData);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const res = await fetch(`${baseUrl}/api/v1/categories`);
+      assert.strictEqual(res.status, 200);
+
+      const json = await res.json();
+      const names = json.data.map((c) => c.name);
+
+      const expectedWithUnknown = [
+        "Electronics",
+        "Audio",
+        "Wearables",
+        "Accessories",
+        "Fashion",
+        "Furniture",
+        "Vehicles",
+        "Mobile Phones",
+        "Art & Collectibles",
+        "Books",
+        "Gaming Consoles",
+        "Others",
+      ];
+
+      assert.deepStrictEqual(
+        names,
+        expectedWithUnknown,
+        "Known categories must be in order, followed by unknown categories (alphabetical), with 'Others' strictly last"
+      );
+      assert.strictEqual(names[names.length - 1], "Others");
+    });
+
+    it("keeps 'Others' at the very end even when only unknown categories and Others exist", async () => {
+      const mockData = [
+        { _id: "cat_others", name: "Others", description: "Other items", isActive: true },
+        { _id: "cat_sports", name: "Sports", description: "Sporting goods", isActive: true },
+        { _id: "cat_music", name: "Musical Instruments", description: "Guitars & Pianos", isActive: true },
+      ];
+
+      const mockCategories = createMockCollection(mockData);
+      setCollections({ categoriesCollection: mockCategories });
+
+      const res = await fetch(`${baseUrl}/api/v1/categories`);
+      assert.strictEqual(res.status, 200);
+
+      const json = await res.json();
+      const names = json.data.map((c) => c.name);
+
+      assert.deepStrictEqual(names, ["Musical Instruments", "Sports", "Others"]);
+      assert.strictEqual(names[names.length - 1], "Others");
     });
 
     it("does not require authentication or authorization tokens (public access)", async () => {
@@ -327,6 +458,43 @@ describe("Categories Collection & Public API Test Suite", () => {
       assert.deepStrictEqual(keys.sort(), ["_id", "description", "isActive", "name"].sort());
       assert.strictEqual(json.data[0].__v, undefined);
       assert.strictEqual(json.data[0].internalClusterId, undefined);
+    });
+
+    describe("3. Unit Tests: Sorting Helper & Priority Map", () => {
+      it("maps predefined category names to distinct integer priorities from 1 to 8", () => {
+        const { getCategoryPriority, PREDEFINED_CATEGORY_ORDER } = categoriesRoutes;
+        assert.ok(Array.isArray(PREDEFINED_CATEGORY_ORDER));
+        assert.strictEqual(PREDEFINED_CATEGORY_ORDER.length, 8);
+
+        PREDEFINED_CATEGORY_ORDER.forEach((name, index) => {
+          assert.strictEqual(getCategoryPriority(name), index + 1);
+        });
+      });
+
+      it("assigns Number.MAX_SAFE_INTEGER to 'Others' and 9999 to unknown categories", () => {
+        const { getCategoryPriority } = categoriesRoutes;
+        assert.strictEqual(getCategoryPriority("Others"), Number.MAX_SAFE_INTEGER);
+        assert.strictEqual(getCategoryPriority("Unknown Cat"), 9999);
+        assert.strictEqual(getCategoryPriority(null), 9999);
+        assert.strictEqual(getCategoryPriority(undefined), 9999);
+      });
+
+      it("sortCategories handles empty arrays, missing fields, and non-array gracefully", () => {
+        const { sortCategories } = categoriesRoutes;
+        assert.deepStrictEqual(sortCategories([]), []);
+        assert.deepStrictEqual(sortCategories(null), []);
+        assert.deepStrictEqual(sortCategories(undefined), []);
+
+        const messy = [
+          { name: "Others" },
+          { name: null },
+          { name: "Electronics" },
+        ];
+        const sorted = sortCategories(messy);
+        assert.strictEqual(sorted[0].name, "Electronics");
+        assert.strictEqual(sorted[1].name, null);
+        assert.strictEqual(sorted[2].name, "Others");
+      });
     });
   });
 });
