@@ -26,6 +26,7 @@ const collections = {
   reportsCollection: null,
   processedEventsCollection: null,
   disputesCollection: null,
+  categoriesCollection: null,
 };
 
 function getCollections() {
@@ -53,6 +54,8 @@ function setCollections(newCollections) {
     collections.processedEventsCollection = newCollections.processedEventsCollection;
   if ("disputesCollection" in newCollections)
     collections.disputesCollection = newCollections.disputesCollection;
+  if ("categoriesCollection" in newCollections)
+    collections.categoriesCollection = newCollections.categoriesCollection;
 }
 
 /**
@@ -205,6 +208,117 @@ async function createIndexes() {
       }
     }
   }
+
+  if (collections.categoriesCollection && typeof collections.categoriesCollection.createIndex === "function") {
+    try {
+      await collections.categoriesCollection.createIndex(
+        { name: 1 },
+        { unique: true, name: "name_1" }
+      );
+    } catch (err) {
+      let isUniqueEnforced = false;
+      if (typeof collections.categoriesCollection.indexes === "function") {
+        try {
+          const idxs = await collections.categoriesCollection.indexes();
+          const existing = idxs.find(
+            (idx) =>
+              idx.name === "name_1" ||
+              (idx.key && idx.key.name === 1 && Object.keys(idx.key).length === 1)
+          );
+          if (existing && existing.unique === true) {
+            isUniqueEnforced = true;
+          }
+        } catch (_) {}
+      }
+
+      if (!isUniqueEnforced) {
+        console.warn(
+          `[INDEX NOTICE] Unique constraint on 'categories.name': ${err.message}`
+        );
+      }
+    }
+  }
+}
+
+const INITIAL_CATEGORIES = [
+  {
+    name: "Electronics",
+    description: "Laptops, computers, displays, and consumer electronics tested and ready for use.",
+    isActive: true,
+  },
+  {
+    name: "Audio",
+    description: "Noise-cancelling headphones, wireless earbuds, premium speakers, and hi-fi gear.",
+    isActive: true,
+  },
+  {
+    name: "Wearables",
+    description: "Smartwatches, fitness bands, health sensors, and wearable smart accessories.",
+    isActive: true,
+  },
+  {
+    name: "Accessories",
+    description: "Ergonomic keyboards, mice, docking stations, chargers, and workspace cables.",
+    isActive: true,
+  },
+  {
+    name: "Fashion",
+    description: "Curated vintage apparel, jackets, shoes, designer streetwear, and everyday accessories.",
+    isActive: true,
+  },
+  {
+    name: "Furniture",
+    description: "Solid wood work desks, ergonomic task chairs, lighting, and living spaces.",
+    isActive: true,
+  },
+  {
+    name: "Vehicles",
+    description: "Commuter bicycles, electric scooters, cycling helmets, and travel equipment.",
+    isActive: true,
+  },
+  {
+    name: "Mobile Phones",
+    description: "Certified pre-owned smartphones, tablets, styluses, and protective cases.",
+    isActive: true,
+  },
+  {
+    name: "Others",
+    description: "Collector's books, instruments, cameras, tools, hobby supplies, and rare finds.",
+    isActive: true,
+  },
+];
+
+/**
+ * Seeds initial category documents idempotently.
+ * Uses bulkWrite with updateOne and $setOnInsert to:
+ * 1. Insert documents if they do not exist.
+ * 2. Never duplicate categories on re-runs.
+ * 3. Never overwrite existing descriptions or deactivate categories if modified.
+ */
+async function seedCategories(categoriesCollection) {
+  if (!categoriesCollection || typeof categoriesCollection.bulkWrite !== "function") return;
+
+  const operations = INITIAL_CATEGORIES.map((category) => ({
+    updateOne: {
+      filter: { name: category.name },
+      update: {
+        $setOnInsert: {
+          name: category.name,
+          description: category.description,
+          isActive: category.isActive,
+        },
+      },
+      upsert: true,
+    },
+  }));
+
+  try {
+    await categoriesCollection.bulkWrite(operations, { ordered: false });
+  } catch (err) {
+    console.warn(
+      `[CATEGORY NOTICE] Category seeding warning: ${err.message || err}`
+    );
+  }
 }
 
 let isInitialized = false;
@@ -237,6 +351,7 @@ async function run() {
       collections.reportsCollection = collections.database.collection("reports");
       collections.processedEventsCollection = collections.database.collection("processed_events");
       collections.disputesCollection = collections.database.collection("disputes");
+      collections.categoriesCollection = collections.database.collection("categories");
 
       await client.db("admin").command({ ping: 1 });
       console.log(
@@ -244,6 +359,7 @@ async function run() {
       );
 
       await createIndexes();
+      await seedCategories(collections.categoriesCollection);
       isInitialized = true;
       return collections;
     } catch (error) {
@@ -275,9 +391,11 @@ async function close() {
 module.exports = {
   client,
   collections,
+  INITIAL_CATEGORIES,
   getCollections,
   setCollections,
   createIndexes,
+  seedCategories,
   run,
   close,
 };

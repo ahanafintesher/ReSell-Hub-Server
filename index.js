@@ -1,7 +1,13 @@
 const express = require("express");
 const { validateEnv, config } = require("./src/config/env");
 const { corsMiddleware } = require("./src/middleware/cors");
-const { client, setCollections, run, close, createIndexes } = require("./src/config/db");
+const {
+  client,
+  setCollections,
+  run,
+  close,
+  createIndexes,
+} = require("./src/config/db");
 const { setStripeInstance } = require("./src/config/stripe");
 const {
   verifyToken,
@@ -24,6 +30,7 @@ const reviewsRoutes = require("./src/routes/reviews.routes");
 const wishlistRoutes = require("./src/routes/wishlist.routes");
 const adminRoutes = require("./src/routes/admin.routes");
 const publicRoutes = require("./src/routes/public.routes");
+const categoriesRoutes = require("./src/routes/categories.routes");
 const usersRoutes = require("./src/routes/users.routes");
 const sellerRoutes = require("./src/routes/seller.routes");
 
@@ -52,6 +59,7 @@ app.get("/", (req, res) => {
 
 // Mount domain routes
 app.use(publicRoutes);
+app.use(categoriesRoutes);
 app.use(usersRoutes);
 app.use(sellerRoutes);
 app.use(productsRoutes);
@@ -70,7 +78,9 @@ app.use(errorHandler);
 if (require.main === module) {
   run()
     .then(() => {
-      const { startRefundRecoveryWorker } = require("./src/utils/refundRecovery");
+      const {
+        startRefundRecoveryWorker,
+      } = require("./src/utils/refundRecovery");
       startRefundRecoveryWorker();
 
       const server = app.listen(port, () => {
@@ -81,7 +91,7 @@ if (require.main === module) {
     .catch((err) => {
       console.error(
         "Fatal startup error: Failed to connect to database or initialize indexes:",
-        err.message || err
+        err.message || err,
       );
       process.exit(1);
     });
