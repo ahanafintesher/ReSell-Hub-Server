@@ -3,6 +3,7 @@ const { ObjectId } = require("mongodb");
 const { getCollections } = require("../config/db");
 const {
   verifyToken,
+  optionalVerifyToken,
   requireRole,
   validateUserIdentity,
 } = require("../middleware/auth");
@@ -64,7 +65,22 @@ router.post(
       }
       product.sellerName =
         product.sellerName || req.user.name || req.user.email;
-      product.status = product.status || "available";
+
+      // Section 5 Enforcement: Seller product submissions MUST always initialize as pending moderation.
+      // Backend rejects client trust for status, moderationStatus, or visibility fields.
+      if (req.user.role !== "admin") {
+        product.status = "pending";
+        product.moderationStatus = "pending";
+        product.isPubliclyVisible = false;
+      } else {
+        product.status = product.status || "available";
+        product.moderationStatus = product.moderationStatus || "approved";
+        product.isPubliclyVisible =
+          product.isPubliclyVisible !== undefined
+            ? Boolean(product.isPubliclyVisible)
+            : true;
+      }
+
       product.createdAt = new Date();
 
       const result = await productsCollection.insertOne(product);
@@ -73,7 +89,7 @@ router.post(
       console.error("Create product error:", error.message || error);
       res.status(500).send({ message: "Failed to create product" });
     }
-  }
+  },
 );
 
 // Get my products (Seller / Admin) - supports both string and object sellerInfo schemas
@@ -97,7 +113,10 @@ router.get(
 
       const result = await productsCollection
         .find({
-          $or: [{ sellerInfo: sellerEmail }, { "sellerInfo.email": sellerEmail }],
+          $or: [
+            { sellerInfo: sellerEmail },
+            { "sellerInfo.email": sellerEmail },
+          ],
         })
         .toArray();
       res.send(result);
@@ -105,11 +124,11 @@ router.get(
       console.error("Get my products error:", error.message || error);
       res.status(500).send({ message: "Failed to fetch products" });
     }
-  }
+  },
 );
 
-// Get all products (Public with Search, Filter, Sort, Pagination)
-router.get("/api/products", async (req, res) => {
+// Get all products (Public with Search, Filter, Sort, Pagination; Admin can view all moderation statuses)
+router.get("/api/products", optionalVerifyToken, async (req, res) => {
   try {
     const { productsCollection } = getCollections();
     if (!productsCollection) {
@@ -139,12 +158,41 @@ router.get("/api/products", async (req, res) => {
       query.condition = req.query.condition.trim();
     }
 
-    // 4. Filter by status. By default, hide rejected products from public view
-    if (req.query.status && typeof req.query.status === "string") {
-      query.status = req.query.status.trim();
+    // 4. Filter by status: enforce moderation visibility
+    const isAdmin = Boolean(req.user && req.user.role === "admin");
+    if (isAdmin) {
+      if (
+        req.query.status &&
+        typeof req.query.status === "string" &&
+        req.query.status.trim() !== "all"
+      ) {
+        query.status = req.query.status.trim();
+      }
     } else {
-      query.status = { $nin: ["rejected"] };
-      query.moderationStatus = { $ne: "rejected" };
+      // Non-admin public visitors and buyers: strictly exclude pending & rejected products
+      if (req.query.status && typeof req.query.status === "string") {
+        const requestedStatus = req.query.status.trim();
+        if (requestedStatus === "pending" || requestedStatus === "rejected") {
+          // Never leak pending or rejected products to public / non-admin callers
+          query.status = "__moderation_restricted__";
+        } else if (
+          requestedStatus === "sold" ||
+          requestedStatus === "available"
+        ) {
+          query.status = requestedStatus;
+          query.moderationStatus = { $nin: ["pending", "rejected"] };
+        } else if (requestedStatus === "all") {
+          query.status = { $nin: ["pending", "rejected"] };
+          query.moderationStatus = { $nin: ["pending", "rejected"] };
+        } else {
+          query.status = requestedStatus;
+          query.moderationStatus = { $nin: ["pending", "rejected"] };
+        }
+      } else {
+        // Default public view: exclude pending and rejected listings
+        query.status = { $nin: ["pending", "rejected"] };
+        query.moderationStatus = { $nin: ["pending", "rejected"] };
+      }
     }
 
     // 5. Filter by price range
@@ -163,9 +211,17 @@ router.get("/api/products", async (req, res) => {
     // 6. Sorting
     const sortParam = req.query.sort;
     if (sortParam) {
-      if (sortParam === "price-low-to-high" || sortParam === "asc" || sortParam === "price_asc") {
+      if (
+        sortParam === "price-low-to-high" ||
+        sortParam === "asc" ||
+        sortParam === "price_asc"
+      ) {
         cursor = cursor.sort({ price: 1 });
-      } else if (sortParam === "price-high-to-low" || sortParam === "desc" || sortParam === "price_desc") {
+      } else if (
+        sortParam === "price-high-to-low" ||
+        sortParam === "desc" ||
+        sortParam === "price_desc"
+      ) {
         cursor = cursor.sort({ price: -1 });
       } else if (sortParam === "newest" || sortParam === "latest") {
         cursor = cursor.sort({ createdAt: -1 });
@@ -177,7 +233,10 @@ router.get("/api/products", async (req, res) => {
 
     if (isPaginated) {
       const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 10));
+      const limit = Math.min(
+        100,
+        Math.max(1, parseInt(req.query.limit, 10) || 10),
+      );
       const skip = (page - 1) * limit;
 
       const total =
@@ -256,7 +315,8 @@ router.post("/api/products/:id/report", verifyToken, async (req, res) => {
       });
       if (existingReport) {
         return res.status(409).json({
-          message: "You have already submitted a pending report for this product",
+          message:
+            "You have already submitted a pending report for this product",
         });
       }
 
@@ -290,37 +350,40 @@ router.post("/api/products/:id/report", verifyToken, async (req, res) => {
 });
 
 // Get featured products (Public)
-router.get("/api/featured", async (req, res) => {
-  try {
-    const { productsCollection } = getCollections();
-    if (!productsCollection) {
-      return res
-        .status(503)
-        .send({ message: "Service Unavailable: Database not connected" });
+router.get(
+  ["/api/products/featured", "/api/featured-products", "/api/featured"],
+  async (req, res) => {
+    try {
+      const { productsCollection } = getCollections();
+      if (!productsCollection) {
+        return res
+          .status(503)
+          .send({ message: "Service Unavailable: Database not connected" });
+      }
+
+      const raw = await productsCollection
+        .find({
+          status: "available",
+          moderationStatus: { $nin: ["pending", "rejected"] },
+        })
+        .limit(6)
+        .toArray();
+
+      const result = raw.map((p) => ({
+        ...p,
+        sellerInfo: sanitizeSellerPublicInfo(p.sellerInfo),
+      }));
+
+      res.send(result);
+    } catch (error) {
+      console.error("Get featured products error:", error.message || error);
+      res.status(500).send({ message: "Failed to fetch featured products" });
     }
+  },
+);
 
-    const raw = await productsCollection
-      .find({
-        status: { $nin: ["sold", "rejected"] },
-        moderationStatus: { $ne: "rejected" },
-      })
-      .limit(6)
-      .toArray();
-
-    const result = raw.map((p) => ({
-      ...p,
-      sellerInfo: sanitizeSellerPublicInfo(p.sellerInfo),
-    }));
-
-    res.send(result);
-  } catch (error) {
-    console.error("Get featured products error:", error.message || error);
-    res.status(500).send({ message: "Failed to fetch featured products" });
-  }
-});
-
-// Get a single product (Public)
-router.get("/api/products/:id", async (req, res) => {
+// Get a single product (Public for approved/available/sold listings; Owner Seller & Admin only for pending/rejected)
+router.get("/api/products/:id", optionalVerifyToken, async (req, res) => {
   try {
     const id = req.params.id;
     if (!ObjectId.isValid(id)) {
@@ -338,6 +401,23 @@ router.get("/api/products/:id", async (req, res) => {
     const result = await productsCollection.findOne(query);
     if (!result) {
       return res.status(404).send({ message: "Product not found" });
+    }
+
+    // Section 5 Security Guard: Pending and rejected products must remain strictly hidden from unauthenticated callers and unauthorized buyers
+    const isPendingOrRejected =
+      result.status === "pending" ||
+      result.status === "rejected" ||
+      result.moderationStatus === "pending" ||
+      result.moderationStatus === "rejected";
+
+    if (isPendingOrRejected) {
+      const sellerEmail = extractEmail(result.sellerInfo);
+      const isOwner =
+        req.user && req.user.email && sellerEmail === req.user.email;
+      const isAdmin = req.user && req.user.role === "admin";
+      if (!isOwner && !isAdmin) {
+        return res.status(404).send({ message: "Product not found" });
+      }
     }
 
     const sanitized = {
@@ -392,23 +472,26 @@ router.patch(
 
       // Ownership verification
       const existingSellerEmail = extractEmail(existing.sellerInfo);
-      if (
-        req.user.role !== "admin" &&
-        existingSellerEmail !== req.user.email
-      ) {
+      if (req.user.role !== "admin" && existingSellerEmail !== req.user.email) {
         return res
           .status(403)
           .send({ message: "Forbidden: You do not own this product" });
       }
 
+      // Section 5 Rules 4 & 8: Strip seller-manipulated moderation fields
       if (req.user.role !== "admin") {
+        delete updatedProduct.status;
+        delete updatedProduct.moderationStatus;
+        delete updatedProduct.moderatedBy;
+        delete updatedProduct.moderatedAt;
+        delete updatedProduct.isPubliclyVisible;
         updatedProduct.sellerInfo = req.user.email;
       }
       updatedProduct.updatedAt = new Date();
 
       const result = await productsCollection.updateOne(
         { _id: new ObjectId(id) },
-        { $set: updatedProduct }
+        { $set: updatedProduct },
       );
 
       res.send(result);
@@ -416,7 +499,46 @@ router.patch(
       console.error("Edit product error:", error.message || error);
       res.status(500).send({ message: "Failed to update product" });
     }
-  }
+  },
+);
+
+// ──────────────────────────────────────────
+// Product Moderation Alias (Admin only)
+// ──────────────────────────────────────────
+router.patch(
+  "/api/products/:id/moderate",
+  verifyToken,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { status, rejectionReason } = req.body || {};
+      const { productsCollection } = getCollections();
+      if (!productsCollection) {
+        return res.status(503).json({ message: "Database not connected" });
+      }
+      const query = ObjectId.isValid(id)
+        ? { _id: new ObjectId(id) }
+        : { _id: id };
+      const isApprovedOrAvailable =
+        status === "approved" || status === "available";
+      const updateDoc = {
+        status: status === "approved" ? "available" : status,
+        moderationStatus: status === "available" ? "approved" : status,
+        isPubliclyVisible: isApprovedOrAvailable,
+        moderatedBy: req.user.email,
+        moderatedAt: new Date(),
+        updatedAt: new Date(),
+      };
+      if (rejectionReason) updateDoc.rejectionReason = rejectionReason;
+      const result = await productsCollection.updateOne(query, {
+        $set: updateDoc,
+      });
+      return res.status(200).json({ success: true, ...result });
+    } catch (err) {
+      return res.status(500).json({ message: err.message });
+    }
+  },
 );
 
 // Delete a product (Owner Seller / Admin)
@@ -447,10 +569,7 @@ router.delete(
 
       // Ownership verification
       const existingSellerEmail = extractEmail(existing.sellerInfo);
-      if (
-        req.user.role !== "admin" &&
-        existingSellerEmail !== req.user.email
-      ) {
+      if (req.user.role !== "admin" && existingSellerEmail !== req.user.email) {
         return res
           .status(403)
           .send({ message: "Forbidden: You do not own this product" });
@@ -469,7 +588,7 @@ router.delete(
       console.error("Delete product error:", error.message || error);
       res.status(500).send({ message: "Failed to delete product" });
     }
-  }
+  },
 );
 
 module.exports = router;

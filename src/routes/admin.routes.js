@@ -323,9 +323,11 @@ router.patch(
       }
 
       // Map "approved" to status: "available" while preserving moderationStatus
+      const isApprovedOrAvailable = status === "approved" || status === "available";
       const updateDoc = {
         status: status === "approved" ? "available" : status,
-        moderationStatus: status,
+        moderationStatus: status === "available" ? "approved" : status,
+        isPubliclyVisible: isApprovedOrAvailable,
         moderatedBy: req.user.email,
         moderatedAt: new Date(),
         updatedAt: new Date(),

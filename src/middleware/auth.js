@@ -121,6 +121,77 @@ const verifyToken = async (req, res, next) => {
   }
 };
 
+// Optional Auth Middleware: If valid Bearer token provided, populates req.user. Otherwise leaves req.user = null without throwing.
+const optionalVerifyToken = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    req.user = null;
+    return next();
+  }
+
+  const parts = authHeader.split(" ");
+  if (parts.length !== 2 || parts[0] !== "Bearer") {
+    req.user = null;
+    return next();
+  }
+
+  const token = parts[1];
+  try {
+    const key =
+      customKeySet ||
+      (config.JWT_SECRET
+        ? new TextEncoder().encode(config.JWT_SECRET)
+        : JWKS);
+
+    const { payload } = await jwtVerify(token, key, {
+      issuer: config.JWT_ISSUER,
+      audience: config.JWT_AUDIENCE,
+    });
+
+    if (
+      !payload.email ||
+      typeof payload.email !== "string" ||
+      !payload.email.trim()
+    ) {
+      req.user = null;
+      return next();
+    }
+
+    const email = payload.email.trim();
+    const { usersCollection } = getCollections();
+
+    if (usersCollection) {
+      let dbUser = await usersCollection.findOne({ email });
+      if (!dbUser && payload.sub) {
+        const idQuery = ObjectId.isValid(payload.sub)
+          ? { _id: new ObjectId(payload.sub) }
+          : { _id: payload.sub };
+        dbUser = await usersCollection.findOne(idQuery);
+      }
+
+      if (dbUser && dbUser.status !== "blocked") {
+        req.user = {
+          ...payload,
+          id: dbUser._id ? dbUser._id.toString() : payload.sub,
+          email: dbUser.email || email,
+          name: dbUser.name || payload.name || "User",
+          role: dbUser.role || "buyer",
+          status: dbUser.status || "active",
+          dbUser,
+        };
+      } else {
+        req.user = null;
+      }
+    } else {
+      req.user = null;
+    }
+    next();
+  } catch {
+    req.user = null;
+    next();
+  }
+};
+
 // Server-controlled role verification helper
 const getUserRole = async (user) => {
   if (!user || !user.email) return null;
@@ -192,6 +263,7 @@ const requireRole = (...allowedRoles) => {
 
 module.exports = {
   verifyToken,
+  optionalVerifyToken,
   requireRole,
   getUserRole,
   validateUserIdentity,

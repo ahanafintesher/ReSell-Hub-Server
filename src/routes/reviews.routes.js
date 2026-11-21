@@ -63,7 +63,9 @@ router.get("/api/reviews", async (req, res) => {
     }
 
     const productId = req.query.productId;
-    const query = productId ? { "review.productId": productId } : {};
+    const query = productId
+      ? { $or: [{ "review.productId": productId }, { productId: productId }] }
+      : {};
     const result = await reviewsCollection.find(query).toArray();
     res.send(result);
   } catch (error) {
@@ -72,7 +74,7 @@ router.get("/api/reviews", async (req, res) => {
   }
 });
 
-// Calculate average rating of a product (Public, supports both spellings)
+// Calculate average rating of a product (Public, supports both spellings and polymorphic root/nested schemas)
 const averageRatingHandler = async (req, res) => {
   try {
     const productId = req.query.productId;
@@ -92,13 +94,15 @@ const averageRatingHandler = async (req, res) => {
     // Safe handling if aggregate is not implemented (e.g. basic mock collection)
     if (typeof reviewsCollection.aggregate !== "function") {
       const reviews = await reviewsCollection
-        .find({ "review.productId": productId })
+        .find({
+          $or: [{ "review.productId": productId }, { productId: productId }],
+        })
         .toArray();
       if (!reviews.length) {
         return res.send({ avarageRating: 0, averageRating: 0 });
       }
       const sum = reviews.reduce(
-        (acc, r) => acc + (r.review?.rating || r.rating || 0),
+        (acc, r) => acc + (r.rating || r.review?.rating || 0),
         0
       );
       const avg = Number((sum / reviews.length).toFixed(1));
@@ -109,19 +113,24 @@ const averageRatingHandler = async (req, res) => {
       .aggregate([
         {
           $match: {
-            "review.productId": productId,
+            $or: [{ "review.productId": productId }, { productId: productId }],
+          },
+        },
+        {
+          $project: {
+            rating: { $ifNull: ["$rating", "$review.rating"] },
           },
         },
         {
           $group: {
-            _id: "$review.productId",
-            avarageRating: { $avg: "$review.rating" },
+            _id: null,
+            avarageRating: { $avg: "$rating" },
           },
         },
       ])
       .toArray();
 
-    if (result.length === 0) {
+    if (result.length === 0 || result[0].avarageRating == null) {
       return res.send({ avarageRating: 0, averageRating: 0 });
     }
 
